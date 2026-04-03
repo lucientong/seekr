@@ -1,0 +1,104 @@
+[package]
+name = "seekr-code"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85.0"
+authors = ["lucientong"]
+description = "A semantic code search engine, smarter than grep. Supports text regex + semantic vector + AST pattern search, 100% local."
+license = "Apache-2.0"
+repository = "https://github.com/lucientong/seekr"
+readme = "README.md"
+keywords = ["search", "code", "semantic", "ast", "grep"]
+categories = ["command-line-utilities", "development-tools"]
+
+[[bin]]
+name = "seekr-code"
+path = "src/main.rs"
+
+[lib]
+name = "seekr_code"
+path = "src/lib.rs"
+
+[dependencies]
+# CLI framework
+clap = { version = "4.5", features = ["derive", "env"] }
+
+# Async runtime
+tokio = { version = "1.50", features = ["full"] }
+
+# HTTP framework
+axum = { version = "0.8", features = ["json"] }
+
+# AST parsing
+tree-sitter = "0.25"
+tree-sitter-language = "0.1"
+tree-sitter-rust = "0.24"
+tree-sitter-python = "0.23"
+tree-sitter-javascript = "0.23"
+tree-sitter-typescript = "0.23"
+tree-sitter-go = "0.23"
+tree-sitter-java = "0.23"
+tree-sitter-c = "0.23"
+tree-sitter-cpp = "0.23"
+tree-sitter-json = "0.24"
+tree-sitter-toml-ng = "0.7"
+tree-sitter-yaml = "0.7"
+tree-sitter-html = "0.23"
+tree-sitter-css = "0.23"
+tree-sitter-ruby = "0.23"
+tree-sitter-bash = "0.23"
+
+# ONNX Runtime
+ort = { version = "2.0.0-rc.12", features = ["download-binaries", "ndarray"] }
+ndarray = "0.17"
+
+# Memory-mapped files
+memmap2 = "0.9"
+
+# .gitignore-aware file traversal
+ignore = "0.4"
+
+# High-performance regex
+regex = "1.11"
+
+# File system watching
+notify = { version = "8.0", features = ["serde"] }
+
+# Error handling
+thiserror = "2.0"
+anyhow = "1.0"
+
+# Logging / tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+
+# HTTP client (model download)
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "blocking"] }
+
+# Hashing
+blake3 = "1.6"
+
+# CLI progress bar
+indicatif = "0.17"
+
+# Colored terminal output
+colored = "3.0"
+
+# Directory paths
+dirs = "6.0"
+
+[dev-dependencies]
+tempfile = "3.14"
+tokio-test = "0.4"
+assert_cmd = "2.0"
+predicates = "3.1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = "symbols"

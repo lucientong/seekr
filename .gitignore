@@ -1,0 +1,25 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+*.pdb
+
+# ONNX model files (downloaded at runtime, not committed)
+*.onnx
+
+# Seekr local data directory
+.seekr/
+
+# IDE
+.vscode/
+.idea/
+.codebuddy/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
