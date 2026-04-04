@@ -1,5 +1,10 @@
 # seekr-code
 
+[![CI](https://github.com/lucientong/seekr/actions/workflows/ci.yml/badge.svg)](https://github.com/lucientong/seekr/actions/workflows/ci.yml)
+[![Crates.io](https://img.shields.io/crates/v/seekr-code.svg)](https://crates.io/crates/seekr-code)
+[![Downloads](https://img.shields.io/crates/d/seekr-code.svg)](https://crates.io/crates/seekr-code)
+[![License](https://img.shields.io/crates/l/seekr-code.svg)](LICENSE)
+
 语义化代码搜索引擎，比 grep 更智能。
 
 支持**文本正则** + **语义向量** + **AST 模式**搜索 — 100% 本地运行，数据不会离开你的机器。

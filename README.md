@@ -1,5 +1,10 @@
 # seekr-code
 
+[![CI](https://github.com/lucientong/seekr/actions/workflows/ci.yml/badge.svg)](https://github.com/lucientong/seekr/actions/workflows/ci.yml)
+[![Crates.io](https://img.shields.io/crates/v/seekr-code.svg)](https://crates.io/crates/seekr-code)
+[![Downloads](https://img.shields.io/crates/d/seekr-code.svg)](https://crates.io/crates/seekr-code)
+[![License](https://img.shields.io/crates/l/seekr-code.svg)](LICENSE)
+
 A semantic code search engine, smarter than grep.
 
 Supports **text regex** + **semantic vector** + **AST pattern** search — 100% local, no data leaves your machine.
