@@ -6,8 +6,8 @@
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use ort::session::builder::GraphOptimizationLevel;
 use ort::session::Session;
+use ort::session::builder::GraphOptimizationLevel;
 use ort::value::TensorRef;
 
 use crate::embedder::traits::Embedder;
@@ -20,7 +20,8 @@ const MODEL_URL: &str = "https://huggingface.co/sentence-transformers/all-MiniLM
 const MODEL_FILENAME: &str = "all-MiniLM-L6-v2-quantized.onnx";
 
 /// Tokenizer URL.
-const TOKENIZER_URL: &str = "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/tokenizer.json";
+const TOKENIZER_URL: &str =
+    "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/tokenizer.json";
 
 /// Tokenizer filename.
 const TOKENIZER_FILENAME: &str = "tokenizer.json";
@@ -98,17 +99,17 @@ impl OnnxEmbedder {
     /// the model's vocabulary.
     fn tokenize(&self, text: &str) -> (Vec<i64>, Vec<i64>) {
         // Encode with special tokens ([CLS] and [SEP] are added automatically)
-        let encoding = self
-            .tokenizer
-            .encode(text, true)
-            .unwrap_or_else(|_| {
-                // Fallback: return empty encoding on error
-                self.tokenizer.encode("", true).unwrap()
-            });
+        let encoding = self.tokenizer.encode(text, true).unwrap_or_else(|_| {
+            // Fallback: return empty encoding on error
+            self.tokenizer.encode("", true).unwrap()
+        });
 
         let mut input_ids: Vec<i64> = encoding.get_ids().iter().map(|&id| id as i64).collect();
-        let mut attention_mask: Vec<i64> =
-            encoding.get_attention_mask().iter().map(|&m| m as i64).collect();
+        let mut attention_mask: Vec<i64> = encoding
+            .get_attention_mask()
+            .iter()
+            .map(|&m| m as i64)
+            .collect();
 
         // Truncate to MAX_SEQ_LENGTH if needed
         if input_ids.len() > MAX_SEQ_LENGTH {
@@ -137,9 +138,8 @@ impl OnnxEmbedder {
     ) -> Result<Vec<f32>, EmbedderError> {
         let seq_len = input_ids.len();
 
-        let input_ids_array =
-            ndarray::Array2::from_shape_vec((1, seq_len), input_ids.to_vec())
-                .map_err(|e| EmbedderError::OnnxError(format!("Shape error: {}", e)))?;
+        let input_ids_array = ndarray::Array2::from_shape_vec((1, seq_len), input_ids.to_vec())
+            .map_err(|e| EmbedderError::OnnxError(format!("Shape error: {}", e)))?;
         let attention_mask_array =
             ndarray::Array2::from_shape_vec((1, seq_len), attention_mask.to_vec())
                 .map_err(|e| EmbedderError::OnnxError(format!("Shape error: {}", e)))?;
@@ -153,9 +153,10 @@ impl OnnxEmbedder {
         let token_type_ids_tensor = TensorRef::from_array_view(&token_type_ids_array)
             .map_err(|e| EmbedderError::OnnxError(format!("Tensor creation error: {}", e)))?;
 
-        let mut session = self.session.lock().map_err(|e| {
-            EmbedderError::OnnxError(format!("Session lock poisoned: {}", e))
-        })?;
+        let mut session = self
+            .session
+            .lock()
+            .map_err(|e| EmbedderError::OnnxError(format!("Session lock poisoned: {}", e)))?;
 
         let outputs = session
             .run(ort::inputs![
@@ -264,11 +265,7 @@ fn download_file(url: &str, dest: &Path) -> Result<(), EmbedderError> {
     std::fs::write(&tmp_path, &bytes).map_err(EmbedderError::Io)?;
     std::fs::rename(&tmp_path, dest).map_err(EmbedderError::Io)?;
 
-    tracing::info!(
-        "Downloaded {} bytes to {}",
-        bytes.len(),
-        dest.display()
-    );
+    tracing::info!("Downloaded {} bytes to {}", bytes.len(), dest.display());
 
     Ok(())
 }

@@ -82,9 +82,7 @@ pub fn parse_pattern(pattern: &str) -> Result<AstPattern, SearchError> {
     let pattern = pattern.trim();
 
     if pattern.is_empty() {
-        return Err(SearchError::InvalidAstPattern(
-            "Empty pattern".to_string(),
-        ));
+        return Err(SearchError::InvalidAstPattern("Empty pattern".to_string()));
     }
 
     let tokens = tokenize_pattern(pattern);
@@ -151,7 +149,7 @@ pub fn search_ast_pattern(
 
     let mut matches: Vec<AstMatch> = Vec::new();
 
-    for (_chunk_id, chunk) in &index.chunks {
+    for chunk in index.chunks.values() {
         let score = match_chunk(&parsed, chunk);
         if score > 0.0 {
             matches.push(AstMatch {
@@ -191,11 +189,7 @@ fn match_chunk(pattern: &AstPattern, chunk: &CodeChunk) -> f32 {
     // 2. Match qualifiers (weight = 0.1)
     if !pattern.qualifiers.is_empty() {
         total_criteria += 0.1;
-        let sig_lower = chunk
-            .signature
-            .as_deref()
-            .unwrap_or("")
-            .to_lowercase();
+        let sig_lower = chunk.signature.as_deref().unwrap_or("").to_lowercase();
         let body_start = chunk.body.lines().next().unwrap_or("").to_lowercase();
         let combined = format!("{} {}", sig_lower, body_start);
 
@@ -205,7 +199,7 @@ fn match_chunk(pattern: &AstPattern, chunk: &CodeChunk) -> f32 {
             .filter(|q| combined.contains(q.as_str()))
             .count();
 
-        if pattern.qualifiers.len() > 0 {
+        if !pattern.qualifiers.is_empty() {
             score += 0.1 * (matched_quals as f32 / pattern.qualifiers.len() as f32);
         }
     }
@@ -216,7 +210,9 @@ fn match_chunk(pattern: &AstPattern, chunk: &CodeChunk) -> f32 {
         if let Some(ref chunk_name) = chunk.name {
             if wildcard_match(name_pat, chunk_name) {
                 score += 0.3;
-            } else if chunk_name.to_lowercase().contains(&name_pat.to_lowercase().replace('*', ""))
+            } else if chunk_name
+                .to_lowercase()
+                .contains(&name_pat.to_lowercase().replace('*', ""))
             {
                 // Partial name match gets partial credit
                 score += 0.15;
@@ -582,7 +578,9 @@ fn extract_return_type_from_signature(sig: &str) -> Option<String> {
     if let Some(close_paren) = sig.rfind(')') {
         let after = sig[close_paren + 1..].trim();
         if let Some(stripped) = after.strip_prefix(':') {
-            let ret = stripped.trim().trim_end_matches(|c: char| c == '{' || c.is_whitespace());
+            let ret = stripped
+                .trim()
+                .trim_end_matches(|c: char| c == '{' || c.is_whitespace());
             if !ret.is_empty() {
                 return Some(ret.to_string());
             }
@@ -613,7 +611,10 @@ fn match_param_types(pattern_params: &[String], chunk_params: &[String]) -> f32 
     }
 
     // Count non-wildcard params in pattern
-    let fixed_params: Vec<&String> = pattern_params.iter().filter(|p| p.as_str() != "*").collect();
+    let fixed_params: Vec<&String> = pattern_params
+        .iter()
+        .filter(|p| p.as_str() != "*")
+        .collect();
 
     if fixed_params.len() > chunk_count {
         return 0.0; // More fixed params than chunk has
@@ -824,7 +825,8 @@ mod tests {
 
     #[test]
     fn test_extract_params_rust() {
-        let params = extract_params_from_signature("fn authenticate(user: &str, password: String) -> bool");
+        let params =
+            extract_params_from_signature("fn authenticate(user: &str, password: String) -> bool");
         assert_eq!(params.len(), 2);
         assert_eq!(params[0], "str");
         assert_eq!(params[1], "String");
@@ -855,7 +857,11 @@ mod tests {
         );
 
         let score = match_chunk(&pat, &chunk);
-        assert!(score > 0.5, "Should match function returning Result, got {}", score);
+        assert!(
+            score > 0.5,
+            "Should match function returning Result, got {}",
+            score
+        );
     }
 
     #[test]
@@ -878,13 +884,7 @@ mod tests {
     fn test_no_match_wrong_kind() {
         let pat = parse_pattern("class Foo").unwrap();
 
-        let chunk = make_chunk(
-            1,
-            ChunkKind::Function,
-            "Foo",
-            "fn Foo()",
-            "fn Foo() {}",
-        );
+        let chunk = make_chunk(1, ChunkKind::Function, "Foo", "fn Foo()", "fn Foo() {}");
 
         let score = match_chunk(&pat, &chunk);
         assert_eq!(score, 0.0, "Should not match wrong kind");

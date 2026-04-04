@@ -159,7 +159,11 @@ impl SeekrConfig {
             let config = Self::default();
             // Attempt to create default config file, but don't fail if we can't
             if let Err(e) = config.save_to(path) {
-                tracing::warn!("Could not write default config to {}: {}", path.display(), e);
+                tracing::warn!(
+                    "Could not write default config to {}: {}",
+                    path.display(),
+                    e
+                );
             }
             return Ok(config);
         }
@@ -227,7 +231,10 @@ mod tests {
         let config = SeekrConfig::default();
         let dir_a = config.project_index_dir(Path::new("/home/user/project-a"));
         let dir_b = config.project_index_dir(Path::new("/home/user/project-b"));
-        assert_ne!(dir_a, dir_b, "Different projects should have different index dirs");
+        assert_ne!(
+            dir_a, dir_b,
+            "Different projects should have different index dirs"
+        );
     }
 
     #[test]

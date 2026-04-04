@@ -7,9 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::Duration;
 
-use notify::{
-    Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher,
-};
+use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 
 use crate::error::ScannerError;
 
@@ -38,17 +36,15 @@ impl FileWatcher {
 
         let sender = tx.clone();
         let mut watcher = RecommendedWatcher::new(
-            move |res: Result<Event, notify::Error>| {
-                match res {
-                    Ok(event) => {
-                        let file_events = convert_event(event);
-                        for fe in file_events {
-                            let _ = sender.send(fe);
-                        }
+            move |res: Result<Event, notify::Error>| match res {
+                Ok(event) => {
+                    let file_events = convert_event(event);
+                    for fe in file_events {
+                        let _ = sender.send(fe);
                     }
-                    Err(e) => {
-                        tracing::warn!("File watcher error: {}", e);
-                    }
+                }
+                Err(e) => {
+                    tracing::warn!("File watcher error: {}", e);
                 }
             },
             Config::default().with_poll_interval(Duration::from_secs(2)),
@@ -139,17 +135,15 @@ pub fn start_async_watcher(
 
     let sender = tx;
     let mut watcher = RecommendedWatcher::new(
-        move |res: Result<Event, notify::Error>| {
-            match res {
-                Ok(event) => {
-                    let file_events = convert_event(event);
-                    for fe in file_events {
-                        let _ = sender.send(fe);
-                    }
+        move |res: Result<Event, notify::Error>| match res {
+            Ok(event) => {
+                let file_events = convert_event(event);
+                for fe in file_events {
+                    let _ = sender.send(fe);
                 }
-                Err(e) => {
-                    tracing::warn!("File watcher error: {}", e);
-                }
+            }
+            Err(e) => {
+                tracing::warn!("File watcher error: {}", e);
             }
         },
         Config::default().with_poll_interval(Duration::from_secs(2)),
@@ -159,11 +153,7 @@ pub fn start_async_watcher(
     watcher
         .watch(watch_path, RecursiveMode::Recursive)
         .map_err(|e| {
-            ScannerError::WatchError(format!(
-                "Failed to watch '{}': {}",
-                watch_path.display(),
-                e,
-            ))
+            ScannerError::WatchError(format!("Failed to watch '{}': {}", watch_path.display(), e,))
         })?;
 
     tracing::info!(path = %watch_path.display(), "Async file watcher started");

@@ -5,8 +5,8 @@
 
 use crate::embedder::traits::Embedder;
 use crate::error::SearchError;
-use crate::index::store::SeekrIndex;
 use crate::index::SearchHit;
+use crate::index::store::SeekrIndex;
 
 /// Options for semantic search.
 #[derive(Debug, Clone)]
@@ -38,9 +38,7 @@ pub fn search_semantic(
     options: &SemanticSearchOptions,
 ) -> Result<Vec<SearchHit>, SearchError> {
     // Embed the query
-    let query_embedding = embedder
-        .embed(query)
-        .map_err(SearchError::Embedder)?;
+    let query_embedding = embedder.embed(query).map_err(SearchError::Embedder)?;
 
     // Search the vector index
     let results = index.search_vector(&query_embedding, options.top_k, options.score_threshold);
@@ -93,7 +91,13 @@ mod tests {
         };
 
         // Search for something similar
-        let results = search_semantic(&index, "fn authenticate(user: &str) {}", &embedder, &options).unwrap();
+        let results = search_semantic(
+            &index,
+            "fn authenticate(user: &str) {}",
+            &embedder,
+            &options,
+        )
+        .unwrap();
         assert!(!results.is_empty());
         // The first result should be the authenticate function (most similar to itself)
         assert_eq!(results[0].chunk_id, 1);
@@ -116,7 +120,8 @@ mod tests {
             score_threshold: 0.99,
         };
 
-        let results = search_semantic(&index, "completely unrelated text", &embedder, &options).unwrap();
+        let results =
+            search_semantic(&index, "completely unrelated text", &embedder, &options).unwrap();
         // With dummy embedder, similarity between different texts should be low
         // This may or may not return results depending on the dummy embedder
         assert!(results.len() <= 1);

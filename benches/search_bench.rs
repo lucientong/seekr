@@ -2,11 +2,11 @@
 //!
 //! Run with: `cargo bench --bench search_bench`
 
-use criterion::{criterion_group, criterion_main, Criterion, BenchmarkId};
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use std::path::PathBuf;
 
-use seekr_code::index::store::{cosine_similarity, SeekrIndex};
-use seekr_code::parser::{CodeChunk, ChunkKind};
+use seekr_code::index::store::{SeekrIndex, cosine_similarity};
+use seekr_code::parser::{ChunkKind, CodeChunk};
 
 /// Create a test chunk with a given ID and body.
 fn make_chunk(id: u64, body: &str) -> CodeChunk {
@@ -54,9 +54,7 @@ fn bench_index_build(c: &mut Criterion) {
         let embeddings: Vec<Vec<f32>> = (0..n).map(|i| random_vec(384, i)).collect();
 
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, _| {
-            b.iter(|| {
-                SeekrIndex::build_from(&chunks, &embeddings, 384)
-            });
+            b.iter(|| SeekrIndex::build_from(&chunks, &embeddings, 384));
         });
     }
 
@@ -77,9 +75,7 @@ fn bench_vector_search(c: &mut Criterion) {
         let query = random_vec(384, 99999);
 
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, _| {
-            b.iter(|| {
-                index.search_vector(&query, 10, 0.0)
-            });
+            b.iter(|| index.search_vector(&query, 10, 0.0));
         });
     }
 
@@ -98,9 +94,7 @@ fn bench_text_search(c: &mut Criterion) {
         let index = SeekrIndex::build_from(&chunks, &embeddings, 384);
 
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, _| {
-            b.iter(|| {
-                index.search_text("authenticate user password", 10)
-            });
+            b.iter(|| index.search_text("authenticate user password", 10));
         });
     }
 
@@ -121,7 +115,12 @@ fn bench_cosine_similarity(c: &mut Criterion) {
 fn bench_save_load(c: &mut Criterion) {
     let n = 1000;
     let chunks: Vec<CodeChunk> = (0..n)
-        .map(|i| make_chunk(i, &format!("fn bench_file_{i}() {{ let data = vec![{i}]; }}")))
+        .map(|i| {
+            make_chunk(
+                i,
+                &format!("fn bench_file_{i}() {{ let data = vec![{i}]; }}"),
+            )
+        })
         .collect();
     let embeddings: Vec<Vec<f32>> = (0..n).map(|i| random_vec(384, i)).collect();
     let index = SeekrIndex::build_from(&chunks, &embeddings, 384);

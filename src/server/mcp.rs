@@ -19,15 +19,17 @@ use crate::config::SeekrConfig;
 use crate::embedder::batch::{BatchEmbedder, DummyEmbedder};
 use crate::embedder::traits::Embedder;
 use crate::index::store::SeekrIndex;
+use crate::parser::CodeChunk;
 use crate::parser::chunker::chunk_file_from_path;
 use crate::parser::summary::generate_summary;
-use crate::parser::CodeChunk;
 use crate::scanner::filter::should_index_file;
 use crate::scanner::walker::walk_directory;
 use crate::search::ast_pattern::search_ast_pattern;
-use crate::search::fusion::{fuse_ast_only, fuse_semantic_only, fuse_text_only, rrf_fuse, rrf_fuse_three};
-use crate::search::semantic::{search_semantic, SemanticSearchOptions};
-use crate::search::text::{search_text_regex, TextSearchOptions};
+use crate::search::fusion::{
+    fuse_ast_only, fuse_semantic_only, fuse_text_only, rrf_fuse, rrf_fuse_three,
+};
+use crate::search::semantic::{SemanticSearchOptions, search_semantic};
+use crate::search::text::{TextSearchOptions, search_text_regex};
 use crate::search::{SearchMode, SearchResult};
 
 // ============================================================
@@ -135,11 +137,7 @@ pub fn run_mcp_stdio(config: &SeekrConfig) -> Result<(), crate::error::ServerErr
         let request: JsonRpcRequest = match serde_json::from_str(line) {
             Ok(req) => req,
             Err(e) => {
-                let resp = JsonRpcResponse::error(
-                    None,
-                    ERROR_PARSE,
-                    format!("Parse error: {}", e),
-                );
+                let resp = JsonRpcResponse::error(None, ERROR_PARSE, format!("Parse error: {}", e));
                 write_response(&mut stdout, &resp);
                 continue;
             }
@@ -181,10 +179,7 @@ fn handle_request(request: &JsonRpcRequest, config: &SeekrConfig) -> JsonRpcResp
             // since some clients expect it
             JsonRpcResponse::success(request.id.clone(), Value::Null)
         }
-        "ping" => JsonRpcResponse::success(
-            request.id.clone(),
-            serde_json::json!({}),
-        ),
+        "ping" => JsonRpcResponse::success(request.id.clone(), serde_json::json!({})),
 
         // MCP discovery
         "tools/list" => handle_tools_list(request),
@@ -314,7 +309,10 @@ fn handle_tools_call(request: &JsonRpcRequest, config: &SeekrConfig) -> JsonRpcR
     };
 
     let tool_name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
-    let arguments = params.get("arguments").cloned().unwrap_or(Value::Object(Default::default()));
+    let arguments = params
+        .get("arguments")
+        .cloned()
+        .unwrap_or(Value::Object(Default::default()));
 
     match tool_name {
         "seekr_search" => handle_tool_search(request.id.clone(), &arguments, config),
@@ -466,7 +464,7 @@ fn handle_tool_index(
     }
 
     // Embed
-    let summaries: Vec<String> = all_chunks.iter().map(|c| generate_summary(c)).collect();
+    let summaries: Vec<String> = all_chunks.iter().map(generate_summary).collect();
 
     let embeddings = match create_embedder(config) {
         Ok(embedder) => {
@@ -491,7 +489,10 @@ fn handle_tool_index(
         }
     };
 
-    let embedding_dim = embeddings.first().map(|e: &Vec<f32>| e.len()).unwrap_or(384);
+    let embedding_dim = embeddings
+        .first()
+        .map(|e: &Vec<f32>| e.len())
+        .unwrap_or(384);
 
     // Build and save
     let index = SeekrIndex::build_from(&all_chunks, &embeddings, embedding_dim);
@@ -545,7 +546,8 @@ fn handle_tool_status(
 
     let index_dir = config.project_index_dir(&project_path);
     // Check for v2 bincode index first, fall back to v1 JSON index
-    let index_exists = index_dir.join("index.bin").exists() || index_dir.join("index.json").exists();
+    let index_exists =
+        index_dir.join("index.bin").exists() || index_dir.join("index.json").exists();
 
     let message = if !index_exists {
         format!(
@@ -610,8 +612,7 @@ fn execute_search(
                 context_lines: config.search.context_lines,
                 top_k,
             };
-            let results = search_text_regex(index, query, &options)
-                .map_err(|e| e.to_string())?;
+            let results = search_text_regex(index, query, &options).map_err(|e| e.to_string())?;
             Ok(fuse_text_only(&results, top_k))
         }
         SearchMode::Semantic => {
@@ -630,8 +631,8 @@ fn execute_search(
                 context_lines: config.search.context_lines,
                 top_k,
             };
-            let text_results = search_text_regex(index, query, &text_options)
-                .map_err(|e| e.to_string())?;
+            let text_results =
+                search_text_regex(index, query, &text_options).map_err(|e| e.to_string())?;
 
             let embedder = create_embedder(config)?;
             let semantic_options = SemanticSearchOptions {
@@ -665,8 +666,7 @@ fn execute_search(
             }
         }
         SearchMode::Ast => {
-            let results = search_ast_pattern(index, query, top_k)
-                .map_err(|e| e.to_string())?;
+            let results = search_ast_pattern(index, query, top_k).map_err(|e| e.to_string())?;
             Ok(fuse_ast_only(&results, top_k))
         }
     }

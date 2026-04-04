@@ -15,15 +15,17 @@ use crate::embedder::traits::Embedder;
 use crate::error::SeekrError;
 use crate::index::incremental::IncrementalState;
 use crate::index::store::SeekrIndex;
+use crate::parser::CodeChunk;
 use crate::parser::chunker::chunk_file_from_path;
 use crate::parser::summary::generate_summary;
-use crate::parser::CodeChunk;
 use crate::scanner::filter::should_index_file;
 use crate::scanner::walker::walk_directory;
 use crate::search::ast_pattern::search_ast_pattern;
-use crate::search::fusion::{fuse_ast_only, fuse_semantic_only, fuse_text_only, rrf_fuse, rrf_fuse_three};
-use crate::search::semantic::{search_semantic, SemanticSearchOptions};
-use crate::search::text::{search_text_regex, TextSearchOptions};
+use crate::search::fusion::{
+    fuse_ast_only, fuse_semantic_only, fuse_text_only, rrf_fuse, rrf_fuse_three,
+};
+use crate::search::semantic::{SemanticSearchOptions, search_semantic};
+use crate::search::text::{TextSearchOptions, search_text_regex};
 use crate::search::{SearchMode, SearchQuery, SearchResponse, SearchResult};
 
 /// Execute the `seekr-code index` command.
@@ -121,7 +123,10 @@ pub fn cmd_index(
                 "project": project_path.display().to_string(),
                 "unchanged_files": changes.unchanged.len(),
             });
-            println!("{}", serde_json::to_string_pretty(&status).unwrap_or_default());
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&status).unwrap_or_default()
+            );
         }
         return Ok(());
     }
@@ -204,10 +209,7 @@ pub fn cmd_index(
     }
 
     // Step 4: Generate summaries for embedding
-    let summaries: Vec<String> = new_chunks
-        .iter()
-        .map(|chunk| generate_summary(chunk))
-        .collect();
+    let summaries: Vec<String> = new_chunks.iter().map(generate_summary).collect();
 
     // Step 5: Generate embeddings
     if !json_output && !new_chunks.is_empty() {
@@ -223,9 +225,11 @@ pub fn cmd_index(
                 let pb_embed = if !json_output {
                     let pb = ProgressBar::new(summaries.len() as u64);
                     pb.set_style(
-                        ProgressStyle::with_template("  {bar:40.green/blue} {pos}/{len} embeddings")
-                            .unwrap()
-                            .progress_chars("██░"),
+                        ProgressStyle::with_template(
+                            "  {bar:40.green/blue} {pos}/{len} embeddings",
+                        )
+                        .unwrap()
+                        .progress_chars("██░"),
                     );
                     Some(pb)
                 } else {
@@ -259,7 +263,9 @@ pub fn cmd_index(
         }
     };
 
-    let embedding_dim = embeddings.first().map(|e: &Vec<f32>| e.len())
+    let embedding_dim = embeddings
+        .first()
+        .map(|e: &Vec<f32>| e.len())
         .or_else(|| existing_index.as_ref().map(|idx| idx.embedding_dim))
         .unwrap_or(384);
 
@@ -324,7 +330,10 @@ pub fn cmd_index(
             "index_dir": index_dir.display().to_string(),
             "duration_ms": elapsed.as_millis(),
         });
-        println!("{}", serde_json::to_string_pretty(&status).unwrap_or_default());
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&status).unwrap_or_default()
+        );
     } else {
         eprintln!(
             "  {} Index built: {} chunks in {:.1}s{}",
@@ -333,11 +342,7 @@ pub fn cmd_index(
             elapsed.as_secs_f64(),
             if !force { " (incremental)" } else { "" },
         );
-        eprintln!(
-            "  {} Saved to {}",
-            "✓".green(),
-            index_dir.display(),
-        );
+        eprintln!("  {} Saved to {}", "✓".green(), index_dir.display(),);
     }
 
     Ok(())
@@ -359,18 +364,17 @@ pub fn cmd_search(
     let start = Instant::now();
 
     // Parse search mode
-    let search_mode: SearchMode = mode.parse().map_err(|e: String| {
-        SeekrError::Search(crate::error::SearchError::InvalidRegex(e))
-    })?;
+    let search_mode: SearchMode = mode
+        .parse()
+        .map_err(|e: String| SeekrError::Search(crate::error::SearchError::InvalidRegex(e)))?;
 
     // Load index
     let index_dir = config.project_index_dir(&project_path);
-    let index = SeekrIndex::load(&index_dir).map_err(|e| {
+    let index = SeekrIndex::load(&index_dir).inspect_err(|_e| {
         tracing::error!(
             "Failed to load index from {}. Run `seekr-code index` first.",
             index_dir.display()
         );
-        e
     })?;
 
     // Execute search based on mode
@@ -418,7 +422,13 @@ pub fn cmd_search(
                 rrf_fuse(&text_results, &semantic_results, config.search.rrf_k, top_k)
             } else {
                 // 3-way fusion with AST
-                rrf_fuse_three(&text_results, &semantic_results, &ast_results, config.search.rrf_k, top_k)
+                rrf_fuse_three(
+                    &text_results,
+                    &semantic_results,
+                    &ast_results,
+                    config.search.rrf_k,
+                    top_k,
+                )
             }
         }
         SearchMode::Ast => {
@@ -519,11 +529,14 @@ pub fn cmd_status(
                 "message": "No index found. Run `seekr-code index` to build one.",
             })
         };
-        println!("{}", serde_json::to_string_pretty(&status).unwrap_or_default());
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&status).unwrap_or_default()
+        );
     } else if exists {
         match SeekrIndex::load(&index_dir) {
             Ok(index) => {
-                eprintln!("{} Index status for {}", "📊".to_string(), project_path.display());
+                eprintln!("📊 Index status for {}", project_path.display());
                 eprintln!("  {} Project: {}", "•".blue(), project_path.display());
                 eprintln!("  {} Index dir: {}", "•".blue(), index_dir.display());
                 eprintln!(
@@ -531,19 +544,11 @@ pub fn cmd_status(
                     "•".blue(),
                     index.chunk_count.to_string().green()
                 );
-                eprintln!(
-                    "  {} Embedding dim: {}",
-                    "•".blue(),
-                    index.embedding_dim,
-                );
+                eprintln!("  {} Embedding dim: {}", "•".blue(), index.embedding_dim,);
                 eprintln!("  {} Version: {}", "•".blue(), index.version);
             }
             Err(e) => {
-                eprintln!(
-                    "{} Index found but could not load: {}",
-                    "⚠".yellow(),
-                    e
-                );
+                eprintln!("{} Index found but could not load: {}", "⚠".yellow(), e);
             }
         }
     } else {
@@ -552,7 +557,10 @@ pub fn cmd_status(
             "⚠".yellow(),
             project_path.display()
         );
-        eprintln!("  Run `seekr-code index {}` to build one.", project_path.display());
+        eprintln!(
+            "  Run `seekr-code index {}` to build one.",
+            project_path.display()
+        );
     }
 
     Ok(())
@@ -566,8 +574,7 @@ fn print_results_colored(results: &[SearchResult], elapsed: &std::time::Duration
     }
 
     eprintln!(
-        "\n{} {} results in {:.1}ms\n",
-        "🔍".to_string(),
+        "\n🔍 {} results in {:.1}ms\n",
         results.len(),
         elapsed.as_secs_f64() * 1000.0,
     );
@@ -591,12 +598,7 @@ fn print_results_colored(results: &[SearchResult], elapsed: &std::time::Duration
         // Show line range
         let line_start = result.chunk.line_range.start + 1; // 1-indexed
         let line_end = result.chunk.line_range.end;
-        println!(
-            "    {} L{}-L{}",
-            "│".dimmed(),
-            line_start,
-            line_end,
-        );
+        println!("    {} L{}-L{}", "│".dimmed(), line_start, line_end,);
 
         // Show signature or first few lines of body
         if let Some(ref sig) = result.chunk.signature {

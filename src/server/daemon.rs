@@ -11,8 +11,8 @@ use tokio::sync::RwLock;
 
 use crate::config::SeekrConfig;
 use crate::embedder::traits::Embedder;
-use crate::index::store::SeekrIndex;
 use crate::index::incremental::IncrementalState;
+use crate::index::store::SeekrIndex;
 use crate::scanner::watcher::{FileEvent, dedup_events, start_async_watcher};
 
 /// Default debounce interval in milliseconds.
@@ -215,8 +215,8 @@ async fn process_single_file(
     let content = std::fs::read(file).map_err(|e| e.to_string())?;
 
     // Parse into chunks using the existing chunker
-    let parse_result = crate::parser::chunker::chunk_file_from_path(file)
-        .map_err(|e| e.to_string())?;
+    let parse_result =
+        crate::parser::chunker::chunk_file_from_path(file).map_err(|e| e.to_string())?;
 
     let chunks = match parse_result {
         Some(result) => result.chunks,
@@ -234,9 +234,7 @@ async fn process_single_file(
 
     // Generate embeddings
     let texts: Vec<&str> = chunks.iter().map(|c| c.body.as_str()).collect();
-    let embeddings = embedder
-        .embed_batch(&texts)
-        .map_err(|e| e.to_string())?;
+    let embeddings = embedder.embed_batch(&texts).map_err(|e| e.to_string())?;
 
     // Add to index
     let mut chunk_ids = Vec::new();
@@ -263,9 +261,8 @@ async fn process_single_file(
 /// Check if a file has a supported extension for indexing.
 fn is_supported_file(path: &Path) -> bool {
     let supported = [
-        "rs", "py", "js", "jsx", "ts", "tsx", "go", "java", "c", "cpp", "h",
-        "hpp", "rb", "sh", "bash", "json", "toml", "yaml", "yml", "html",
-        "css",
+        "rs", "py", "js", "jsx", "ts", "tsx", "go", "java", "c", "cpp", "h", "hpp", "rb", "sh",
+        "bash", "json", "toml", "yaml", "yml", "html", "css",
     ];
 
     path.extension()

@@ -38,4 +38,3 @@ impl Embedder for Box<dyn Embedder> {
         (**self).dimension()
     }
 }
-

@@ -20,15 +20,17 @@ use crate::config::SeekrConfig;
 use crate::embedder::batch::{BatchEmbedder, DummyEmbedder};
 use crate::embedder::traits::Embedder;
 use crate::index::store::SeekrIndex;
+use crate::parser::CodeChunk;
 use crate::parser::chunker::chunk_file_from_path;
 use crate::parser::summary::generate_summary;
-use crate::parser::CodeChunk;
 use crate::scanner::filter::should_index_file;
 use crate::scanner::walker::walk_directory;
 use crate::search::ast_pattern::search_ast_pattern;
-use crate::search::fusion::{fuse_ast_only, fuse_semantic_only, fuse_text_only, rrf_fuse, rrf_fuse_three};
-use crate::search::semantic::{search_semantic, SemanticSearchOptions};
-use crate::search::text::{search_text_regex, TextSearchOptions};
+use crate::search::fusion::{
+    fuse_ast_only, fuse_semantic_only, fuse_text_only, rrf_fuse, rrf_fuse_three,
+};
+use crate::search::semantic::{SemanticSearchOptions, search_semantic};
+use crate::search::text::{TextSearchOptions, search_text_regex};
 use crate::search::{SearchMode, SearchQuery, SearchResponse, SearchResult};
 
 /// Shared application state for HTTP handlers.
@@ -147,12 +149,13 @@ pub async fn start_http_server(
     let addr = format!("{}:{}", host, port);
     tracing::info!(address = %addr, "Starting HTTP server");
 
-    let listener = TcpListener::bind(&addr).await.map_err(|e| {
-        crate::error::ServerError::BindFailed {
-            address: addr.clone(),
-            source: e,
-        }
-    })?;
+    let listener =
+        TcpListener::bind(&addr)
+            .await
+            .map_err(|e| crate::error::ServerError::BindFailed {
+                address: addr.clone(),
+                source: e,
+            })?;
 
     tracing::info!(address = %addr, "HTTP server listening");
 
@@ -292,8 +295,8 @@ async fn handle_search(
                 score_threshold: config.search.score_threshold,
             };
             let semantic_results =
-                search_semantic(&index, &req.query, embedder.as_ref(), &semantic_options)
-                    .map_err(|e| {
+                search_semantic(&index, &req.query, embedder.as_ref(), &semantic_options).map_err(
+                    |e| {
                         (
                             StatusCode::INTERNAL_SERVER_ERROR,
                             Json(ErrorResponse {
@@ -301,20 +304,15 @@ async fn handle_search(
                                 details: Some(e.to_string()),
                             }),
                         )
-                    })?;
+                    },
+                )?;
 
             // Try AST pattern search — silently degrade if query isn't a valid AST pattern
-            let ast_results =
-                search_ast_pattern(&index, &req.query, top_k).unwrap_or_default();
+            let ast_results = search_ast_pattern(&index, &req.query, top_k).unwrap_or_default();
 
             if ast_results.is_empty() {
                 // 2-way fusion when no AST matches
-                rrf_fuse(
-                    &text_results,
-                    &semantic_results,
-                    config.search.rrf_k,
-                    top_k,
-                )
+                rrf_fuse(&text_results, &semantic_results, config.search.rrf_k, top_k)
             } else {
                 // 3-way fusion with AST
                 rrf_fuse_three(
@@ -327,16 +325,15 @@ async fn handle_search(
             }
         }
         SearchMode::Ast => {
-            let ast_results =
-                search_ast_pattern(&index, &req.query, top_k).map_err(|e| {
-                    (
-                        StatusCode::BAD_REQUEST,
-                        Json(ErrorResponse {
-                            error: "AST pattern search failed".to_string(),
-                            details: Some(e.to_string()),
-                        }),
-                    )
-                })?;
+            let ast_results = search_ast_pattern(&index, &req.query, top_k).map_err(|e| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse {
+                        error: "AST pattern search failed".to_string(),
+                        details: Some(e.to_string()),
+                    }),
+                )
+            })?;
             fuse_ast_only(&ast_results, top_k)
         }
     };
@@ -431,10 +428,7 @@ async fn handle_index(
     }
 
     // Step 3: Generate summaries
-    let summaries: Vec<String> = all_chunks
-        .iter()
-        .map(|chunk| generate_summary(chunk))
-        .collect();
+    let summaries: Vec<String> = all_chunks.iter().map(generate_summary).collect();
 
     // Step 4: Generate embeddings
     let embeddings = match create_embedder(config) {
@@ -465,7 +459,10 @@ async fn handle_index(
         }
     };
 
-    let embedding_dim = embeddings.first().map(|e: &Vec<f32>| e.len()).unwrap_or(384);
+    let embedding_dim = embeddings
+        .first()
+        .map(|e: &Vec<f32>| e.len())
+        .unwrap_or(384);
 
     // Step 5: Build and save index
     let index = SeekrIndex::build_from(&all_chunks, &embeddings, embedding_dim);
@@ -505,7 +502,8 @@ async fn handle_status(
 
     let index_dir = config.project_index_dir(&project_path);
     // Check for v2 bincode index first, fall back to v1 JSON index
-    let index_exists = index_dir.join("index.bin").exists() || index_dir.join("index.json").exists();
+    let index_exists =
+        index_dir.join("index.bin").exists() || index_dir.join("index.json").exists();
 
     if !index_exists {
         return Json(StatusResponse {

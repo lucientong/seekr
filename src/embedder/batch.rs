@@ -86,7 +86,9 @@ impl Embedder for DummyEmbedder {
         }
 
         for (i, val) in embedding.iter_mut().enumerate() {
-            hash = hash.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            hash = hash
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             *val = ((hash >> 33) as f32 / u32::MAX as f32) * 2.0 - 1.0;
             // Mix in position
             let _ = i; // suppress unused warning, position affects hash via iteration
@@ -120,7 +122,10 @@ mod tests {
 
         // Check L2 norm ≈ 1.0
         let norm: f32 = embedding.iter().map(|x| x * x).sum::<f32>().sqrt();
-        assert!((norm - 1.0).abs() < 0.01, "Embedding should be L2 normalized");
+        assert!(
+            (norm - 1.0).abs() < 0.01,
+            "Embedding should be L2 normalized"
+        );
     }
 
     #[test]
@@ -136,7 +141,10 @@ mod tests {
         let embedder = DummyEmbedder::new(384);
         let e1 = embedder.embed("hello").unwrap();
         let e2 = embedder.embed("world").unwrap();
-        assert_ne!(e1, e2, "Different inputs should produce different embeddings");
+        assert_ne!(
+            e1, e2,
+            "Different inputs should produce different embeddings"
+        );
     }
 
     #[test]

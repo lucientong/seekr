@@ -15,10 +15,7 @@ use crate::scanner::{ScanEntry, ScanResult};
 /// Walk a directory tree in parallel, returning all matching file entries.
 ///
 /// Respects `.gitignore` rules and applies configured filters.
-pub fn walk_directory(
-    root: &Path,
-    config: &SeekrConfig,
-) -> Result<ScanResult, ScannerError> {
+pub fn walk_directory(root: &Path, config: &SeekrConfig) -> Result<ScanResult, ScannerError> {
     let start = std::time::Instant::now();
 
     let mut builder = WalkBuilder::new(root);
@@ -37,9 +34,9 @@ pub fn walk_directory(
     for pattern in &config.exclude_patterns {
         // Negate the pattern to make it an exclude
         let exclude = format!("!{}", pattern);
-        overrides_builder
-            .add(&exclude)
-            .map_err(|e| ScannerError::FilterError(format!("Invalid exclude pattern '{}': {}", pattern, e)))?;
+        overrides_builder.add(&exclude).map_err(|e| {
+            ScannerError::FilterError(format!("Invalid exclude pattern '{}': {}", pattern, e))
+        })?;
     }
     let overrides = overrides_builder
         .build()
@@ -55,7 +52,7 @@ pub fn walk_directory(
             match entry {
                 Ok(dir_entry) => {
                     // Skip directories, we only want files
-                    if dir_entry.file_type().map_or(false, |ft| ft.is_file()) {
+                    if dir_entry.file_type().is_some_and(|ft| ft.is_file()) {
                         let path = dir_entry.path().to_path_buf();
 
                         // Get file metadata
@@ -108,16 +105,13 @@ pub fn walk_directory(
 
 /// Walk a directory tree sequentially (simpler, for smaller directories).
 pub fn walk_directory_simple(root: &Path) -> Result<Vec<PathBuf>, ScannerError> {
-    let walker = WalkBuilder::new(root)
-        .hidden(true)
-        .git_ignore(true)
-        .build();
+    let walker = WalkBuilder::new(root).hidden(true).git_ignore(true).build();
 
     let mut files = Vec::new();
     for entry in walker {
         match entry {
             Ok(dir_entry) => {
-                if dir_entry.file_type().map_or(false, |ft| ft.is_file()) {
+                if dir_entry.file_type().is_some_and(|ft| ft.is_file()) {
                     files.push(dir_entry.path().to_path_buf());
                 }
             }

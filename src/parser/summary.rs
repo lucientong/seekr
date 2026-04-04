@@ -121,7 +121,9 @@ mod tests {
         let chunk = make_chunk(
             ChunkKind::Function,
             "authenticate_user",
-            Some("pub fn authenticate_user(username: &str, password: &str) -> Result<String, AuthError>"),
+            Some(
+                "pub fn authenticate_user(username: &str, password: &str) -> Result<String, AuthError>",
+            ),
             Some("Validates the provided credentials against the database."),
             "pub fn authenticate_user(username: &str, password: &str) -> Result<String, AuthError> {\n    let user = find_user(username)?;\n    verify(password, &user.hash)\n}",
         );

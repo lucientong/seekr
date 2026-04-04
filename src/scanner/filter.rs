@@ -16,15 +16,32 @@ const SOURCE_EXTENSIONS: &[&str] = &[
     // Rust
     "rs",
     // Python
-    "py", "pyi", "pyx",
+    "py",
+    "pyi",
+    "pyx",
     // JavaScript / TypeScript
-    "js", "jsx", "mjs", "cjs", "ts", "tsx", "mts", "cts",
+    "js",
+    "jsx",
+    "mjs",
+    "cjs",
+    "ts",
+    "tsx",
+    "mts",
+    "cts",
     // Go
     "go",
     // Java / Kotlin
-    "java", "kt", "kts",
+    "java",
+    "kt",
+    "kts",
     // C / C++
-    "c", "h", "cc", "cpp", "cxx", "hpp", "hxx",
+    "c",
+    "h",
+    "cc",
+    "cpp",
+    "cxx",
+    "hpp",
+    "hxx",
     // C#
     "cs",
     // Ruby
@@ -36,13 +53,29 @@ const SOURCE_EXTENSIONS: &[&str] = &[
     // Scala
     "scala",
     // Shell
-    "sh", "bash", "zsh", "fish",
+    "sh",
+    "bash",
+    "zsh",
+    "fish",
     // Web
-    "html", "htm", "css", "scss", "sass", "less",
+    "html",
+    "htm",
+    "css",
+    "scss",
+    "sass",
+    "less",
     // Data / Config
-    "json", "yaml", "yml", "toml", "xml", "ini", "cfg",
+    "json",
+    "yaml",
+    "yml",
+    "toml",
+    "xml",
+    "ini",
+    "cfg",
     // Markdown / Docs
-    "md", "rst", "txt",
+    "md",
+    "rst",
+    "txt",
     // SQL
     "sql",
     // Lua
@@ -50,11 +83,14 @@ const SOURCE_EXTENSIONS: &[&str] = &[
     // Dart
     "dart",
     // Elixir / Erlang
-    "ex", "exs", "erl",
+    "ex",
+    "exs",
+    "erl",
     // Haskell
     "hs",
     // OCaml
-    "ml", "mli",
+    "ml",
+    "mli",
     // Zig
     "zig",
     // Protobuf
@@ -176,7 +212,11 @@ mod tests {
         let max_size = 10 * 1024 * 1024; // 10 MB
 
         assert!(should_index_file(Path::new("main.rs"), 1000, max_size));
-        assert!(!should_index_file(Path::new("main.rs"), max_size + 1, max_size));
+        assert!(!should_index_file(
+            Path::new("main.rs"),
+            max_size + 1,
+            max_size
+        ));
         assert!(!should_index_file(Path::new("image.png"), 1000, max_size));
     }
 }

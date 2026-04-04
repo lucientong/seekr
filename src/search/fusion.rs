@@ -192,10 +192,7 @@ pub fn rrf_fuse_three(
 }
 
 /// Fuse only semantic results (used when text search is not applicable).
-pub fn fuse_semantic_only(
-    semantic_results: &[SearchHit],
-    top_k: usize,
-) -> Vec<FusedResult> {
+pub fn fuse_semantic_only(semantic_results: &[SearchHit], top_k: usize) -> Vec<FusedResult> {
     semantic_results
         .iter()
         .take(top_k)
@@ -211,10 +208,7 @@ pub fn fuse_semantic_only(
 }
 
 /// Fuse only text results (used when semantic search is not applicable).
-pub fn fuse_text_only(
-    text_results: &[TextMatch],
-    top_k: usize,
-) -> Vec<FusedResult> {
+pub fn fuse_text_only(text_results: &[TextMatch], top_k: usize) -> Vec<FusedResult> {
     text_results
         .iter()
         .take(top_k)
@@ -230,10 +224,7 @@ pub fn fuse_text_only(
 }
 
 /// Fuse only AST pattern search results.
-pub fn fuse_ast_only(
-    ast_results: &[AstMatch],
-    top_k: usize,
-) -> Vec<FusedResult> {
+pub fn fuse_ast_only(ast_results: &[AstMatch], top_k: usize) -> Vec<FusedResult> {
     ast_results
         .iter()
         .take(top_k)

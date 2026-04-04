@@ -8,21 +8,23 @@ use std::path::{Path, PathBuf};
 use seekr_code::config::SeekrConfig;
 use seekr_code::embedder::batch::{BatchEmbedder, DummyEmbedder};
 use seekr_code::embedder::traits::Embedder;
-use seekr_code::index::store::SeekrIndex;
 use seekr_code::index::IndexEntry;
 use seekr_code::index::incremental::IncrementalState;
+use seekr_code::index::store::SeekrIndex;
+use seekr_code::parser::CodeChunk;
 use seekr_code::parser::chunker::chunk_file_from_path;
 use seekr_code::parser::summary::generate_summary;
-use seekr_code::parser::CodeChunk;
 use seekr_code::scanner::filter::should_index_file;
 use seekr_code::scanner::walker::walk_directory;
 use seekr_code::search::ast_pattern::{parse_pattern, search_ast_pattern};
 use seekr_code::search::fusion::rrf_fuse;
-use seekr_code::search::semantic::{search_semantic, SemanticSearchOptions};
-use seekr_code::search::text::{search_text_regex, TextSearchOptions};
+use seekr_code::search::semantic::{SemanticSearchOptions, search_semantic};
+use seekr_code::search::text::{TextSearchOptions, search_text_regex};
 
 fn fixtures_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests").join("fixtures")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
 }
 
 // ============================================================
@@ -44,13 +46,29 @@ fn test_scanner_finds_fixtures() {
     let extensions: Vec<String> = result
         .entries
         .iter()
-        .filter_map(|e| e.path.extension().map(|ext| ext.to_string_lossy().to_string()))
+        .filter_map(|e| {
+            e.path
+                .extension()
+                .map(|ext| ext.to_string_lossy().to_string())
+        })
         .collect();
 
-    assert!(extensions.contains(&"rs".to_string()), "Should find .rs files");
-    assert!(extensions.contains(&"py".to_string()), "Should find .py files");
-    assert!(extensions.contains(&"js".to_string()), "Should find .js files");
-    assert!(extensions.contains(&"go".to_string()), "Should find .go files");
+    assert!(
+        extensions.contains(&"rs".to_string()),
+        "Should find .rs files"
+    );
+    assert!(
+        extensions.contains(&"py".to_string()),
+        "Should find .py files"
+    );
+    assert!(
+        extensions.contains(&"js".to_string()),
+        "Should find .js files"
+    );
+    assert!(
+        extensions.contains(&"go".to_string()),
+        "Should find .go files"
+    );
 }
 
 #[test]
@@ -153,8 +171,7 @@ fn test_parser_summary_generation() {
         // Summary should contain either the name or some code content
         if let Some(ref name) = chunk.name {
             assert!(
-                summary.to_lowercase().contains(&name.to_lowercase())
-                    || !summary.is_empty(),
+                summary.to_lowercase().contains(&name.to_lowercase()) || !summary.is_empty(),
                 "Summary should reference the chunk name"
             );
         }
@@ -169,14 +186,15 @@ fn test_parser_summary_generation() {
 fn test_embedder_batch_processing() {
     let embedder = DummyEmbedder::new(384);
 
-    let texts = vec![
+    let texts = [
         "fn authenticate(user: &str)",
         "class UserService",
         "async function fetchData()",
     ];
 
     let batch = BatchEmbedder::new(embedder, 32);
-    let embeddings = batch.embed_all(&texts.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+    let embeddings = batch
+        .embed_all(&texts.iter().map(|s| s.to_string()).collect::<Vec<_>>())
         .unwrap();
 
     assert_eq!(embeddings.len(), 3);
@@ -192,7 +210,10 @@ fn test_embedder_different_inputs_different_embeddings() {
     let emb1 = embedder.embed("fn authenticate()").unwrap();
     let emb2 = embedder.embed("class UserService").unwrap();
 
-    assert_ne!(emb1, emb2, "Different inputs should produce different embeddings");
+    assert_ne!(
+        emb1, emb2,
+        "Different inputs should produce different embeddings"
+    );
 }
 
 // ============================================================
@@ -217,7 +238,7 @@ fn test_index_build_from_fixtures() {
 
     // Generate embeddings
     let embedder = DummyEmbedder::new(64);
-    let summaries: Vec<String> = all_chunks.iter().map(|c| generate_summary(c)).collect();
+    let summaries: Vec<String> = all_chunks.iter().map(generate_summary).collect();
     let batch = BatchEmbedder::new(embedder, 32);
     let embeddings = batch.embed_all(&summaries).unwrap();
 
@@ -283,7 +304,7 @@ fn build_test_index() -> SeekrIndex {
     }
 
     let embedder = DummyEmbedder::new(64);
-    let summaries: Vec<String> = all_chunks.iter().map(|c| generate_summary(c)).collect();
+    let summaries: Vec<String> = all_chunks.iter().map(generate_summary).collect();
     let batch = BatchEmbedder::new(embedder, 32);
     let embeddings = batch.embed_all(&summaries).unwrap();
 
@@ -318,11 +339,9 @@ fn test_semantic_search_on_fixtures() {
         score_threshold: 0.0,
     };
 
-    let results = search_semantic(&index, "user authentication login", &embedder, &options).unwrap();
-    assert!(
-        !results.is_empty(),
-        "Semantic search should return results"
-    );
+    let results =
+        search_semantic(&index, "user authentication login", &embedder, &options).unwrap();
+    assert!(!results.is_empty(), "Semantic search should return results");
 }
 
 #[test]
@@ -402,7 +421,7 @@ fn test_end_to_end_pipeline() {
     assert!(!all_chunks.is_empty(), "Should produce code chunks");
 
     // Step 4: Generate summaries + embeddings
-    let summaries: Vec<String> = all_chunks.iter().map(|c| generate_summary(c)).collect();
+    let summaries: Vec<String> = all_chunks.iter().map(generate_summary).collect();
     let embedder = DummyEmbedder::new(64);
     let batch = BatchEmbedder::new(embedder, 32);
     let embeddings = batch.embed_all(&summaries).unwrap();
@@ -425,7 +444,10 @@ fn test_end_to_end_pipeline() {
         top_k: 10,
     };
     let text_results = search_text_regex(&loaded_index, "authenticate", &text_options).unwrap();
-    assert!(!text_results.is_empty(), "Text search should find authenticate");
+    assert!(
+        !text_results.is_empty(),
+        "Text search should find authenticate"
+    );
 
     // Step 8: Semantic search
     let search_embedder = DummyEmbedder::new(64);
@@ -440,7 +462,10 @@ fn test_end_to_end_pipeline() {
         &semantic_options,
     )
     .unwrap();
-    assert!(!semantic_results.is_empty(), "Semantic search should return results");
+    assert!(
+        !semantic_results.is_empty(),
+        "Semantic search should return results"
+    );
 
     // Step 9: Fusion
     let fused = rrf_fuse(&text_results, &semantic_results, 60, 5);
@@ -474,12 +499,18 @@ fn test_ast_pattern_parsing_comprehensive() {
 
     // Class pattern
     let pat = parse_pattern("class *Service").unwrap();
-    assert_eq!(pat.kind, seekr_code::search::ast_pattern::PatternKind::Class);
+    assert_eq!(
+        pat.kind,
+        seekr_code::search::ast_pattern::PatternKind::Class
+    );
     assert_eq!(pat.name_pattern.as_deref(), Some("*Service"));
 
     // Struct with wildcard
     let pat = parse_pattern("struct *Config").unwrap();
-    assert_eq!(pat.kind, seekr_code::search::ast_pattern::PatternKind::Struct);
+    assert_eq!(
+        pat.kind,
+        seekr_code::search::ast_pattern::PatternKind::Struct
+    );
 
     // Enum pattern
     let pat = parse_pattern("enum *Error").unwrap();
@@ -509,9 +540,19 @@ fn test_incremental_state_tracks_files() {
     state.update_file(PathBuf::from("/test/b.rs"), content, vec![3, 4]);
 
     assert_eq!(state.files.len(), 2);
-    assert_eq!(state.chunk_ids_for_file(Path::new("/test/a.rs")), vec![1, 2]);
-    assert_eq!(state.chunk_ids_for_file(Path::new("/test/b.rs")), vec![3, 4]);
-    assert!(state.chunk_ids_for_file(Path::new("/test/nonexistent.rs")).is_empty());
+    assert_eq!(
+        state.chunk_ids_for_file(Path::new("/test/a.rs")),
+        vec![1, 2]
+    );
+    assert_eq!(
+        state.chunk_ids_for_file(Path::new("/test/b.rs")),
+        vec![3, 4]
+    );
+    assert!(
+        state
+            .chunk_ids_for_file(Path::new("/test/nonexistent.rs"))
+            .is_empty()
+    );
 }
 
 #[test]
@@ -522,10 +563,8 @@ fn test_incremental_apply_deletions() {
     state.update_file(PathBuf::from("/test/b.rs"), b"code b", vec![3, 4]);
     state.update_file(PathBuf::from("/test/c.rs"), b"code c", vec![5]);
 
-    let removed = state.apply_deletions(&[
-        PathBuf::from("/test/a.rs"),
-        PathBuf::from("/test/c.rs"),
-    ]);
+    let removed =
+        state.apply_deletions(&[PathBuf::from("/test/a.rs"), PathBuf::from("/test/c.rs")]);
 
     assert_eq!(state.files.len(), 1);
     assert!(state.files.contains_key(&PathBuf::from("/test/b.rs")));
@@ -544,8 +583,16 @@ fn test_incremental_state_persistence() {
 
     // Create and save state
     let mut state = IncrementalState::default();
-    state.update_file(PathBuf::from("/project/src/main.rs"), b"fn main() {}", vec![1, 2, 3]);
-    state.update_file(PathBuf::from("/project/src/lib.rs"), b"pub mod config;", vec![4]);
+    state.update_file(
+        PathBuf::from("/project/src/main.rs"),
+        b"fn main() {}",
+        vec![1, 2, 3],
+    );
+    state.update_file(
+        PathBuf::from("/project/src/lib.rs"),
+        b"pub mod config;",
+        vec![4],
+    );
     state.save(&state_path).unwrap();
 
     // Load and verify

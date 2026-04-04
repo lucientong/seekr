@@ -126,7 +126,12 @@ fn main() -> anyhow::Result<()> {
             tracing::info!(path = %path, force = force, "Building index");
             seekr_code::server::cli::cmd_index(&path, force, &config, cli.json)?;
         }
-        Commands::Serve { host, port, mcp, watch } => {
+        Commands::Serve {
+            host,
+            port,
+            mcp,
+            watch,
+        } => {
             if mcp {
                 if watch.is_some() {
                     tracing::warn!("--watch is not supported in MCP stdio mode, ignoring");
@@ -140,17 +145,27 @@ fn main() -> anyhow::Result<()> {
                 rt.block_on(async {
                     // If --watch is specified, spawn the watch daemon alongside the HTTP server
                     if let Some(watch_path) = watch {
-                        let watch_dir = std::path::Path::new(&watch_path).canonicalize()
-                            .map_err(|e| anyhow::anyhow!("Invalid watch path '{}': {}", watch_path, e))?;
+                        let watch_dir =
+                            std::path::Path::new(&watch_path)
+                                .canonicalize()
+                                .map_err(|e| {
+                                    anyhow::anyhow!("Invalid watch path '{}': {}", watch_path, e)
+                                })?;
 
                         // Load or create initial index for the watch path
                         let index_dir = config.index_dir.join(
-                            watch_dir.file_name().unwrap_or_default().to_string_lossy().as_ref()
+                            watch_dir
+                                .file_name()
+                                .unwrap_or_default()
+                                .to_string_lossy()
+                                .as_ref(),
                         );
                         let index = match seekr_code::index::store::SeekrIndex::load(&index_dir) {
                             Ok(idx) => idx,
                             Err(_) => {
-                                tracing::info!("No existing index found, starting with empty index");
+                                tracing::info!(
+                                    "No existing index found, starting with empty index"
+                                );
                                 seekr_code::index::store::SeekrIndex::new(384)
                             }
                         };
@@ -166,7 +181,9 @@ fn main() -> anyhow::Result<()> {
                                 &daemon_config,
                                 daemon_index,
                                 None,
-                            ).await {
+                            )
+                            .await
+                            {
                                 tracing::error!("Watch daemon error: {}", e);
                             }
                         });
@@ -177,7 +194,8 @@ fn main() -> anyhow::Result<()> {
                         );
                     }
 
-                    seekr_code::server::http::start_http_server(&host, port, config).await
+                    seekr_code::server::http::start_http_server(&host, port, config)
+                        .await
                         .map_err(|e| anyhow::anyhow!("{}", e))
                 })?;
             }

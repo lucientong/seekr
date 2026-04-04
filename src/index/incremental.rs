@@ -52,8 +52,9 @@ impl IncrementalState {
         }
 
         let data = std::fs::read(path)?;
-        serde_json::from_slice(&data)
-            .map_err(|e| IndexError::Serialization(format!("Failed to load incremental state: {}", e)))
+        serde_json::from_slice(&data).map_err(|e| {
+            IndexError::Serialization(format!("Failed to load incremental state: {}", e))
+        })
     }
 
     /// Save incremental state to disk.
@@ -78,9 +79,7 @@ impl IncrementalState {
         for file in current_files {
             if let Some(prev_state) = self.files.get(file) {
                 // Check if file has changed
-                let mtime = std::fs::metadata(file)
-                    .and_then(|m| m.modified())
-                    .ok();
+                let mtime = std::fs::metadata(file).and_then(|m| m.modified()).ok();
 
                 if mtime != Some(prev_state.mtime) {
                     // Mtime changed, verify with content hash

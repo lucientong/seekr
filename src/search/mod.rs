@@ -92,7 +92,10 @@ impl std::str::FromStr for SearchMode {
             "semantic" => Ok(SearchMode::Semantic),
             "ast" => Ok(SearchMode::Ast),
             "hybrid" => Ok(SearchMode::Hybrid),
-            _ => Err(format!("Unknown search mode: '{}'. Use: text, semantic, ast, hybrid", s)),
+            _ => Err(format!(
+                "Unknown search mode: '{}'. Use: text, semantic, ast, hybrid",
+                s
+            )),
         }
     }
 }

@@ -90,7 +90,11 @@ pub fn search_text_regex(
     }
 
     // Sort by score descending
-    matches.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    matches.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     // Truncate to top-k
     matches.truncate(options.top_k);
@@ -112,9 +116,8 @@ pub fn search_text_in_file(
         .build()
         .map_err(|e| SearchError::InvalidRegex(e.to_string()))?;
 
-    let content = std::fs::read_to_string(file_path).map_err(|e| {
-        SearchError::Index(crate::error::IndexError::Io(e))
-    })?;
+    let content = std::fs::read_to_string(file_path)
+        .map_err(|e| SearchError::Index(crate::error::IndexError::Io(e)))?;
 
     let mut results = Vec::new();
     for (line_idx, line) in content.lines().enumerate() {
@@ -143,12 +146,12 @@ pub fn get_match_context(
         let start = match_line.saturating_sub(context_lines);
         let end = (match_line + context_lines + 1).min(total);
 
-        for line_idx in start..end {
+        for (line_idx, line) in lines.iter().enumerate().take(end).skip(start) {
             if included.insert(line_idx) {
                 let is_match = matched_lines.contains(&line_idx);
                 result.push((
                     line_idx + chunk.line_range.start, // absolute line number
-                    lines[line_idx].to_string(),
+                    line.to_string(),
                     is_match,
                 ));
             }

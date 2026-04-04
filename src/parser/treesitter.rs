@@ -194,12 +194,12 @@ pub fn parse_source(
     lang: SupportedLanguage,
 ) -> Result<tree_sitter::Tree, ParserError> {
     let mut parser = create_parser(lang)?;
-    parser.parse(source, None).ok_or_else(|| {
-        ParserError::ParseFailed {
+    parser
+        .parse(source, None)
+        .ok_or_else(|| ParserError::ParseFailed {
             path: std::path::PathBuf::from("<string>"),
             reason: "Parser returned None".to_string(),
-        }
-    })
+        })
 }
 
 impl std::fmt::Display for SupportedLanguage {
@@ -214,9 +214,18 @@ mod tests {
 
     #[test]
     fn test_language_detection() {
-        assert_eq!(SupportedLanguage::from_extension("rs"), Some(SupportedLanguage::Rust));
-        assert_eq!(SupportedLanguage::from_extension("py"), Some(SupportedLanguage::Python));
-        assert_eq!(SupportedLanguage::from_extension("tsx"), Some(SupportedLanguage::Tsx));
+        assert_eq!(
+            SupportedLanguage::from_extension("rs"),
+            Some(SupportedLanguage::Rust)
+        );
+        assert_eq!(
+            SupportedLanguage::from_extension("py"),
+            Some(SupportedLanguage::Python)
+        );
+        assert_eq!(
+            SupportedLanguage::from_extension("tsx"),
+            Some(SupportedLanguage::Tsx)
+        );
         assert_eq!(SupportedLanguage::from_extension("unknown"), None);
     }
 
@@ -268,7 +277,11 @@ mod tests {
 
         for lang in languages {
             let parser = create_parser(lang);
-            assert!(parser.is_ok(), "Failed to create parser for {}", lang.name());
+            assert!(
+                parser.is_ok(),
+                "Failed to create parser for {}",
+                lang.name()
+            );
         }
     }
 }

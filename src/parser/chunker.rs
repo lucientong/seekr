@@ -58,14 +58,7 @@ pub fn chunk_file(
         }
     } else {
         // Walk the AST and extract chunks for matching node kinds
-        extract_chunks_recursive(
-            &root,
-            source,
-            path,
-            lang,
-            chunk_kinds,
-            &mut chunks,
-        );
+        extract_chunks_recursive(&root, source, path, lang, chunk_kinds, &mut chunks);
 
         // If no chunks were found via AST, fall back to line-based chunking
         if chunks.is_empty() {
@@ -106,9 +99,7 @@ fn extract_chunks_recursive(
             if cursor.goto_first_child() {
                 loop {
                     let child = cursor.node();
-                    extract_chunks_recursive(
-                        &child, source, file_path, lang, chunk_kinds, chunks,
-                    );
+                    extract_chunks_recursive(&child, source, file_path, lang, chunk_kinds, chunks);
                     if !cursor.goto_next_sibling() {
                         break;
                     }
@@ -121,9 +112,7 @@ fn extract_chunks_recursive(
         if cursor.goto_first_child() {
             loop {
                 let child = cursor.node();
-                extract_chunks_recursive(
-                    &child, source, file_path, lang, chunk_kinds, chunks,
-                );
+                extract_chunks_recursive(&child, source, file_path, lang, chunk_kinds, chunks);
                 if !cursor.goto_next_sibling() {
                     break;
                 }
@@ -194,7 +183,10 @@ fn classify_node_kind(ts_kind: &str, _lang: SupportedLanguage) -> ChunkKind {
             ChunkKind::Function
         }
         // Methods
-        "method_definition" | "method_declaration" | "method" | "singleton_method"
+        "method_definition"
+        | "method_declaration"
+        | "method"
+        | "singleton_method"
         | "constructor_declaration" => ChunkKind::Method,
         // Classes
         "class_declaration" | "class_definition" | "class_specifier" => ChunkKind::Class,
@@ -271,11 +263,7 @@ fn extract_signature(node: &Node, source: &str, _lang: SupportedLanguage) -> Opt
 }
 
 /// Extract documentation comment immediately before a node.
-fn extract_doc_comment(
-    node: &Node,
-    source: &str,
-    _node_start_line: usize,
-) -> Option<String> {
+fn extract_doc_comment(node: &Node, source: &str, _node_start_line: usize) -> Option<String> {
     // Look at previous siblings for comment nodes
     let mut prev = node.prev_sibling();
     let mut comments = Vec::new();
@@ -327,11 +315,7 @@ fn extract_doc_comment(
 }
 
 /// Fallback: split source into line-based chunks when AST chunking yields nothing.
-fn fallback_line_chunks(
-    file_path: &Path,
-    source: &str,
-    lang: SupportedLanguage,
-) -> Vec<CodeChunk> {
+fn fallback_line_chunks(file_path: &Path, source: &str, lang: SupportedLanguage) -> Vec<CodeChunk> {
     let lines: Vec<&str> = source.lines().collect();
     let total_lines = lines.len();
 
@@ -418,18 +402,19 @@ impl User {
     }
 }
 "#;
-        let result = chunk_file(
-            Path::new("test.rs"),
-            source,
-            SupportedLanguage::Rust,
-        )
-        .unwrap();
+        let result = chunk_file(Path::new("test.rs"), source, SupportedLanguage::Rust).unwrap();
 
         assert_eq!(result.language, "rust");
-        assert!(!result.chunks.is_empty(), "Should find at least some chunks");
+        assert!(
+            !result.chunks.is_empty(),
+            "Should find at least some chunks"
+        );
 
         // Should find the greet function
-        let greet = result.chunks.iter().find(|c| c.name.as_deref() == Some("greet"));
+        let greet = result
+            .chunks
+            .iter()
+            .find(|c| c.name.as_deref() == Some("greet"));
         assert!(greet.is_some(), "Should find greet function");
 
         let greet = greet.unwrap();
@@ -454,12 +439,7 @@ class Calculator:
 def standalone_function(x: str) -> bool:
     return len(x) > 0
 "#;
-        let result = chunk_file(
-            Path::new("calc.py"),
-            source,
-            SupportedLanguage::Python,
-        )
-        .unwrap();
+        let result = chunk_file(Path::new("calc.py"), source, SupportedLanguage::Python).unwrap();
 
         assert_eq!(result.language, "python");
         assert!(!result.chunks.is_empty());
@@ -482,12 +462,8 @@ class EventEmitter {
     }
 }
 "#;
-        let result = chunk_file(
-            Path::new("app.js"),
-            source,
-            SupportedLanguage::JavaScript,
-        )
-        .unwrap();
+        let result =
+            chunk_file(Path::new("app.js"), source, SupportedLanguage::JavaScript).unwrap();
 
         assert_eq!(result.language, "javascript");
         assert!(!result.chunks.is_empty());
@@ -497,12 +473,7 @@ class EventEmitter {
     fn test_fallback_chunking() {
         // Create a file with no recognizable AST patterns
         let source = "#!/bin/bash\necho 'hello'\necho 'world'\n".repeat(30);
-        let result = chunk_file(
-            Path::new("script.sh"),
-            &source,
-            SupportedLanguage::Bash,
-        )
-        .unwrap();
+        let result = chunk_file(Path::new("script.sh"), &source, SupportedLanguage::Bash).unwrap();
 
         // Bash has empty chunk_node_kinds, so should get a single block chunk
         assert!(!result.chunks.is_empty());

@@ -7,10 +7,10 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+use crate::INDEX_VERSION;
 use crate::error::IndexError;
 use crate::index::{IndexEntry, SearchHit};
 use crate::parser::CodeChunk;
-use crate::INDEX_VERSION;
 
 // ============================================================
 // HNSW Point wrapper
@@ -138,11 +138,7 @@ impl SeekrIndex {
     /// Build the index from chunks and their embeddings.
     ///
     /// Also builds the HNSW graph for fast approximate nearest neighbor search.
-    pub fn build_from(
-        chunks: &[CodeChunk],
-        embeddings: &[Vec<f32>],
-        embedding_dim: usize,
-    ) -> Self {
+    pub fn build_from(chunks: &[CodeChunk], embeddings: &[Vec<f32>], embedding_dim: usize) -> Self {
         let mut index = Self::new(embedding_dim);
 
         for (chunk, embedding) in chunks.iter().zip(embeddings.iter()) {
@@ -183,10 +179,7 @@ impl SeekrIndex {
         let hnsw_map = instant_distance::Builder::default().build(points, values);
         self.hnsw = Some(hnsw_map);
 
-        tracing::debug!(
-            chunks = self.vectors.len(),
-            "HNSW graph built"
-        );
+        tracing::debug!(chunks = self.vectors.len(), "HNSW graph built");
     }
 
     /// Perform a vector similarity search.
@@ -318,8 +311,8 @@ impl SeekrIndex {
         std::fs::create_dir_all(dir)?;
 
         let index_path = dir.join("index.bin");
-        let data = bincode::serialize(self)
-            .map_err(|e| IndexError::Serialization(e.to_string()))?;
+        let data =
+            bincode::serialize(self).map_err(|e| IndexError::Serialization(e.to_string()))?;
         std::fs::write(&index_path, data)?;
 
         // Remove old JSON index if present (migration from v1)
@@ -348,13 +341,11 @@ impl SeekrIndex {
         let mut index: SeekrIndex = if bin_path.exists() {
             // v2: bincode format
             let data = std::fs::read(&bin_path)?;
-            bincode::deserialize(&data)
-                .map_err(|e| IndexError::Serialization(e.to_string()))?
+            bincode::deserialize(&data).map_err(|e| IndexError::Serialization(e.to_string()))?
         } else if json_path.exists() {
             // v1: JSON format (backward compatibility)
             let data = std::fs::read(&json_path)?;
-            serde_json::from_slice(&data)
-                .map_err(|e| IndexError::Serialization(e.to_string()))?
+            serde_json::from_slice(&data).map_err(|e| IndexError::Serialization(e.to_string()))?
         } else {
             return Err(IndexError::NotFound(bin_path));
         };
@@ -446,7 +437,11 @@ mod tests {
     #[test]
     fn test_build_and_search_text() {
         let chunks = vec![
-            make_test_chunk(1, "authenticate", "fn authenticate(user: &str, password: &str) -> Result<Token, Error>"),
+            make_test_chunk(
+                1,
+                "authenticate",
+                "fn authenticate(user: &str, password: &str) -> Result<Token, Error>",
+            ),
             make_test_chunk(2, "calculate", "fn calculate_total(items: &[Item]) -> f64"),
         ];
         let embeddings = vec![vec![0.1; 8], vec![0.2; 8]];
@@ -475,7 +470,10 @@ mod tests {
         let query = vec![0.9, 0.1, 0.0];
         let results = index.search_vector(&query, 2, 0.0);
         assert!(!results.is_empty());
-        assert_eq!(results[0].chunk_id, 1, "Should find the most similar chunk first");
+        assert_eq!(
+            results[0].chunk_id, 1,
+            "Should find the most similar chunk first"
+        );
     }
 
     #[test]

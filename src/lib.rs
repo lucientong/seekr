@@ -13,10 +13,10 @@ pub mod config;
 pub mod error;
 
 // Core modules — will be implemented in subsequent phases
-pub mod scanner;
-pub mod parser;
 pub mod embedder;
 pub mod index;
+pub mod parser;
+pub mod scanner;
 pub mod search;
 pub mod server;
 
