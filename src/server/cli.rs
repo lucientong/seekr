@@ -490,8 +490,8 @@ pub fn cmd_status(
 
     let index_dir = config.project_index_dir(&project_path);
 
-    let index_path = index_dir.join("index.json");
-    let exists = index_path.exists();
+    // Check for v2 bincode index first, fall back to v1 JSON index
+    let exists = index_dir.join("index.bin").exists() || index_dir.join("index.json").exists();
 
     if json_output {
         let status = if exists {

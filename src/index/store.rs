@@ -1,7 +1,8 @@
 //! Core index storage.
 //!
-//! Manages a simple vector index for semantic search and an inverted text
-//! index for keyword search. Provides build, query, save, and load operations.
+//! Manages a vector index (HNSW + fallback brute-force KNN) for semantic search
+//! and an inverted text index for keyword search. Provides build, query, save,
+//! and load operations.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -11,8 +12,31 @@ use crate::index::{IndexEntry, SearchHit};
 use crate::parser::CodeChunk;
 use crate::INDEX_VERSION;
 
+// ============================================================
+// HNSW Point wrapper
+// ============================================================
+
+/// Wrapper around `Vec<f32>` implementing `instant_distance::Point` for HNSW.
+///
+/// Uses cosine distance (1 - cosine_similarity) as the distance metric,
+/// which is appropriate for L2-normalized embedding vectors.
+#[derive(Clone, Debug)]
+struct EmbeddingPoint(Vec<f32>);
+
+impl instant_distance::Point for EmbeddingPoint {
+    fn distance(&self, other: &Self) -> f32 {
+        // For L2-normalized vectors, cosine_similarity = dot product.
+        // Distance = 1 - similarity (lower is closer).
+        let dot: f32 = self.0.iter().zip(other.0.iter()).map(|(a, b)| a * b).sum();
+        1.0 - dot
+    }
+}
+
 /// The main index structure holding both vector and text indices.
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
+///
+/// Uses HNSW (Hierarchical Navigable Small Worlds) for fast approximate
+/// nearest neighbor search, with brute-force KNN as fallback.
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct SeekrIndex {
     /// Index format version for compatibility checks.
     pub version: u32,
@@ -31,6 +55,23 @@ pub struct SeekrIndex {
 
     /// Total number of indexed chunks.
     pub chunk_count: usize,
+
+    /// HNSW index for fast approximate nearest neighbor search.
+    /// Built in-memory from the vectors HashMap; not serialized to disk.
+    #[serde(skip)]
+    hnsw: Option<instant_distance::HnswMap<EmbeddingPoint, u64>>,
+}
+
+impl std::fmt::Debug for SeekrIndex {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SeekrIndex")
+            .field("version", &self.version)
+            .field("embedding_dim", &self.embedding_dim)
+            .field("chunk_count", &self.chunk_count)
+            .field("vectors_len", &self.vectors.len())
+            .field("hnsw", &self.hnsw.as_ref().map(|_| "Some(<HnswMap>)"))
+            .finish()
+    }
 }
 
 impl SeekrIndex {
@@ -43,6 +84,7 @@ impl SeekrIndex {
             chunks: HashMap::new(),
             embedding_dim,
             chunk_count: 0,
+            hnsw: None,
         }
     }
 
@@ -94,6 +136,8 @@ impl SeekrIndex {
     }
 
     /// Build the index from chunks and their embeddings.
+    ///
+    /// Also builds the HNSW graph for fast approximate nearest neighbor search.
     pub fn build_from(
         chunks: &[CodeChunk],
         embeddings: &[Vec<f32>],
@@ -113,13 +157,93 @@ impl SeekrIndex {
             index.add_entry(entry, chunk.clone());
         }
 
+        // Build HNSW graph from all vectors
+        index.rebuild_hnsw();
+
         index
     }
 
-    /// Perform a vector similarity search (brute-force KNN).
+    /// Rebuild the HNSW graph from the current vectors HashMap.
+    ///
+    /// Called after build_from(), load(), or after incremental updates.
+    pub fn rebuild_hnsw(&mut self) {
+        if self.vectors.is_empty() {
+            self.hnsw = None;
+            return;
+        }
+
+        let mut points = Vec::with_capacity(self.vectors.len());
+        let mut values = Vec::with_capacity(self.vectors.len());
+
+        for (&chunk_id, embedding) in &self.vectors {
+            points.push(EmbeddingPoint(embedding.clone()));
+            values.push(chunk_id);
+        }
+
+        let hnsw_map = instant_distance::Builder::default().build(points, values);
+        self.hnsw = Some(hnsw_map);
+
+        tracing::debug!(
+            chunks = self.vectors.len(),
+            "HNSW graph built"
+        );
+    }
+
+    /// Perform a vector similarity search.
+    ///
+    /// Uses HNSW approximate nearest neighbor search when available (O(log n)),
+    /// falling back to brute-force KNN (O(n*d)) for older indexes or when
+    /// HNSW is not built.
     ///
     /// Returns the top-k most similar chunks by cosine similarity.
     pub fn search_vector(
+        &self,
+        query_embedding: &[f32],
+        top_k: usize,
+        score_threshold: f32,
+    ) -> Vec<SearchHit> {
+        if let Some(ref hnsw) = self.hnsw {
+            // Fast path: HNSW approximate nearest neighbor search
+            self.search_vector_hnsw(hnsw, query_embedding, top_k, score_threshold)
+        } else {
+            // Fallback: brute-force KNN (for backward compatibility or small indexes)
+            self.search_vector_brute_force(query_embedding, top_k, score_threshold)
+        }
+    }
+
+    /// HNSW-based vector search (O(log n) per query).
+    fn search_vector_hnsw(
+        &self,
+        hnsw: &instant_distance::HnswMap<EmbeddingPoint, u64>,
+        query_embedding: &[f32],
+        top_k: usize,
+        score_threshold: f32,
+    ) -> Vec<SearchHit> {
+        let query_point = EmbeddingPoint(query_embedding.to_vec());
+        let mut search = instant_distance::Search::default();
+
+        let results: Vec<SearchHit> = hnsw
+            .search(&query_point, &mut search)
+            .take(top_k)
+            .filter_map(|item| {
+                let chunk_id = *item.value;
+                // Convert distance back to similarity: similarity = 1 - distance
+                let score = 1.0 - item.distance;
+                if score >= score_threshold {
+                    Some(SearchHit { chunk_id, score })
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        results
+    }
+
+    /// Brute-force KNN vector search (O(n*d) per query).
+    ///
+    /// Used as fallback when HNSW index is not available.
+    fn search_vector_brute_force(
         &self,
         query_embedding: &[f32],
         top_k: usize,
@@ -188,34 +312,52 @@ impl SeekrIndex {
     }
 
     /// Save the index to a directory.
+    ///
+    /// Uses bincode for fast binary serialization (v2 format).
     pub fn save(&self, dir: &Path) -> Result<(), IndexError> {
         std::fs::create_dir_all(dir)?;
 
-        let index_path = dir.join("index.json");
-        let data = serde_json::to_vec(self)
+        let index_path = dir.join("index.bin");
+        let data = bincode::serialize(self)
             .map_err(|e| IndexError::Serialization(e.to_string()))?;
         std::fs::write(&index_path, data)?;
+
+        // Remove old JSON index if present (migration from v1)
+        let old_json_path = dir.join("index.json");
+        if old_json_path.exists() {
+            let _ = std::fs::remove_file(&old_json_path);
+        }
 
         tracing::info!(
             chunks = self.chunk_count,
             path = %dir.display(),
-            "Index saved"
+            "Index saved (bincode v2)"
         );
 
         Ok(())
     }
 
     /// Load an index from a directory.
+    ///
+    /// Tries bincode format (v2) first, then falls back to JSON (v1) for migration.
+    /// After loading, rebuilds the HNSW graph from the vectors for fast search.
     pub fn load(dir: &Path) -> Result<Self, IndexError> {
-        let index_path = dir.join("index.json");
+        let bin_path = dir.join("index.bin");
+        let json_path = dir.join("index.json");
 
-        if !index_path.exists() {
-            return Err(IndexError::NotFound(index_path));
-        }
-
-        let data = std::fs::read(&index_path)?;
-        let index: SeekrIndex = serde_json::from_slice(&data)
-            .map_err(|e| IndexError::Serialization(e.to_string()))?;
+        let mut index: SeekrIndex = if bin_path.exists() {
+            // v2: bincode format
+            let data = std::fs::read(&bin_path)?;
+            bincode::deserialize(&data)
+                .map_err(|e| IndexError::Serialization(e.to_string()))?
+        } else if json_path.exists() {
+            // v1: JSON format (backward compatibility)
+            let data = std::fs::read(&json_path)?;
+            serde_json::from_slice(&data)
+                .map_err(|e| IndexError::Serialization(e.to_string()))?
+        } else {
+            return Err(IndexError::NotFound(bin_path));
+        };
 
         // Version check
         if index.version != INDEX_VERSION {
@@ -225,10 +367,13 @@ impl SeekrIndex {
             });
         }
 
+        // Rebuild HNSW graph from loaded vectors
+        index.rebuild_hnsw();
+
         tracing::info!(
             chunks = index.chunk_count,
             path = %dir.display(),
-            "Index loaded"
+            "Index loaded (HNSW rebuilt)"
         );
 
         Ok(index)

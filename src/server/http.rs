@@ -26,7 +26,7 @@ use crate::parser::CodeChunk;
 use crate::scanner::filter::should_index_file;
 use crate::scanner::walker::walk_directory;
 use crate::search::ast_pattern::search_ast_pattern;
-use crate::search::fusion::{fuse_ast_only, fuse_semantic_only, fuse_text_only, rrf_fuse};
+use crate::search::fusion::{fuse_ast_only, fuse_semantic_only, fuse_text_only, rrf_fuse, rrf_fuse_three};
 use crate::search::semantic::{search_semantic, SemanticSearchOptions};
 use crate::search::text::{search_text_regex, TextSearchOptions};
 use crate::search::{SearchMode, SearchQuery, SearchResponse, SearchResult};
@@ -303,12 +303,28 @@ async fn handle_search(
                         )
                     })?;
 
-            rrf_fuse(
-                &text_results,
-                &semantic_results,
-                config.search.rrf_k,
-                top_k,
-            )
+            // Try AST pattern search — silently degrade if query isn't a valid AST pattern
+            let ast_results =
+                search_ast_pattern(&index, &req.query, top_k).unwrap_or_default();
+
+            if ast_results.is_empty() {
+                // 2-way fusion when no AST matches
+                rrf_fuse(
+                    &text_results,
+                    &semantic_results,
+                    config.search.rrf_k,
+                    top_k,
+                )
+            } else {
+                // 3-way fusion with AST
+                rrf_fuse_three(
+                    &text_results,
+                    &semantic_results,
+                    &ast_results,
+                    config.search.rrf_k,
+                    top_k,
+                )
+            }
         }
         SearchMode::Ast => {
             let ast_results =
@@ -488,9 +504,10 @@ async fn handle_status(
         .unwrap_or_else(|_| Path::new(&query.path).to_path_buf());
 
     let index_dir = config.project_index_dir(&project_path);
-    let index_path = index_dir.join("index.json");
+    // Check for v2 bincode index first, fall back to v1 JSON index
+    let index_exists = index_dir.join("index.bin").exists() || index_dir.join("index.json").exists();
 
-    if !index_path.exists() {
+    if !index_exists {
         return Json(StatusResponse {
             indexed: false,
             project: project_path.display().to_string(),

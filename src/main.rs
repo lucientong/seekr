@@ -73,6 +73,10 @@ enum Commands {
         /// Run as MCP server over stdio instead of HTTP
         #[arg(long)]
         mcp: bool,
+
+        /// Watch a directory for file changes and update the index in real-time
+        #[arg(long)]
+        watch: Option<String>,
     },
 
     /// Show index status for a project
@@ -122,8 +126,11 @@ fn main() -> anyhow::Result<()> {
             tracing::info!(path = %path, force = force, "Building index");
             seekr_code::server::cli::cmd_index(&path, force, &config, cli.json)?;
         }
-        Commands::Serve { host, port, mcp } => {
+        Commands::Serve { host, port, mcp, watch } => {
             if mcp {
+                if watch.is_some() {
+                    tracing::warn!("--watch is not supported in MCP stdio mode, ignoring");
+                }
                 tracing::info!("Starting MCP server on stdio");
                 seekr_code::server::mcp::run_mcp_stdio(&config)?;
             } else {
@@ -131,7 +138,47 @@ fn main() -> anyhow::Result<()> {
                 let rt = tokio::runtime::Runtime::new()
                     .map_err(|e| anyhow::anyhow!("Failed to create tokio runtime: {}", e))?;
                 rt.block_on(async {
+                    // If --watch is specified, spawn the watch daemon alongside the HTTP server
+                    if let Some(watch_path) = watch {
+                        let watch_dir = std::path::Path::new(&watch_path).canonicalize()
+                            .map_err(|e| anyhow::anyhow!("Invalid watch path '{}': {}", watch_path, e))?;
+
+                        // Load or create initial index for the watch path
+                        let index_dir = config.index_dir.join(
+                            watch_dir.file_name().unwrap_or_default().to_string_lossy().as_ref()
+                        );
+                        let index = match seekr_code::index::store::SeekrIndex::load(&index_dir) {
+                            Ok(idx) => idx,
+                            Err(_) => {
+                                tracing::info!("No existing index found, starting with empty index");
+                                seekr_code::index::store::SeekrIndex::new(384)
+                            }
+                        };
+                        let shared_index = std::sync::Arc::new(tokio::sync::RwLock::new(index));
+
+                        // Spawn watch daemon
+                        let daemon_config = config.clone();
+                        let daemon_index = shared_index.clone();
+                        let daemon_path = watch_dir.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = seekr_code::server::daemon::run_watch_daemon(
+                                &daemon_path,
+                                &daemon_config,
+                                daemon_index,
+                                None,
+                            ).await {
+                                tracing::error!("Watch daemon error: {}", e);
+                            }
+                        });
+
+                        tracing::info!(
+                            watch_path = %watch_dir.display(),
+                            "Watch daemon started alongside HTTP server"
+                        );
+                    }
+
                     seekr_code::server::http::start_http_server(&host, port, config).await
+                        .map_err(|e| anyhow::anyhow!("{}", e))
                 })?;
             }
         }

@@ -9,12 +9,13 @@ Supports **text regex** + **semantic vector** + **AST pattern** search — 100% 
 ## Features
 
 - 🔍 **Text Search** — High-performance regex matching across code
-- 🧠 **Semantic Search** — Local ONNX-based embedding + HNSW KNN search, find code by meaning
+- 🧠 **Semantic Search** — Local ONNX-based embedding with HuggingFace WordPiece tokenizer + HNSW ANN index, find code by meaning
 - 🌳 **AST Pattern Search** — Match function signatures, structs, classes via Tree-sitter (e.g., `fn(*) -> Result`)
-- ⚡ **Hybrid Mode** — Combine all three via Reciprocal Rank Fusion (RRF) for best results
+- ⚡ **Hybrid Mode** — Combine all three via 3-way Reciprocal Rank Fusion (RRF) for best results
 - 📡 **MCP Server** — Model Context Protocol support for AI editor integration
 - 🌐 **HTTP API** — REST API for integration with other tools
 - 🔄 **Incremental Indexing** — Only re-process changed files
+- 👁️ **Watch Daemon** — Real-time file monitoring with automatic incremental re-indexing
 - 🗂️ **15 Languages** — Rust, Python, JavaScript, TypeScript, Go, Java, C, C++, Ruby, Bash, HTML, CSS, JSON, TOML, YAML
 
 ## Installation
@@ -99,6 +100,9 @@ seekr-code serve
 
 # Custom host and port
 seekr-code serve --host 0.0.0.0 --port 8080
+
+# Start with watch daemon — auto re-index on file changes
+seekr-code serve --watch /path/to/project
 ```
 
 **Endpoints:**
@@ -200,9 +204,25 @@ batch_size = 32
 
 1. **Scanner** — Walks the project directory, respects `.gitignore`, filters by file type/size
 2. **Parser** — Uses Tree-sitter to parse source files into semantic code chunks (functions, classes, structs, etc.)
-3. **Embedder** — Generates vector embeddings using ONNX Runtime + all-MiniLM-L6-v2
-4. **Index** — Builds inverted text index + HNSW vector index, persisted to disk
-5. **Search** — Text regex, semantic KNN, AST pattern matching, fused via RRF
+3. **Embedder** — Generates vector embeddings using ONNX Runtime + all-MiniLM-L6-v2 with HuggingFace WordPiece tokenizer
+4. **Index** — Builds inverted text index + HNSW vector index, persisted to disk via bincode binary format
+5. **Search** — Text regex, semantic HNSW ANN (with brute-force KNN fallback), AST pattern matching, fused via 3-way RRF
+6. **Watch** — Optional file system monitoring with debounced incremental re-indexing
+
+## Benchmarks
+
+Run the benchmark suite with:
+
+```bash
+cargo bench --bench search_bench
+```
+
+Benchmarks cover:
+- Index construction (100 / 500 / 1000 chunks)
+- Vector search latency (500 / 1000 / 5000 chunks)
+- Text search latency (inverted index)
+- Cosine similarity computation (384d)
+- Index save/load throughput (bincode)
 
 ## Environment Variables
 

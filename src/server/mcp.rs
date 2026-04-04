@@ -25,7 +25,7 @@ use crate::parser::CodeChunk;
 use crate::scanner::filter::should_index_file;
 use crate::scanner::walker::walk_directory;
 use crate::search::ast_pattern::search_ast_pattern;
-use crate::search::fusion::{fuse_ast_only, fuse_semantic_only, fuse_text_only, rrf_fuse};
+use crate::search::fusion::{fuse_ast_only, fuse_semantic_only, fuse_text_only, rrf_fuse, rrf_fuse_three};
 use crate::search::semantic::{search_semantic, SemanticSearchOptions};
 use crate::search::text::{search_text_regex, TextSearchOptions};
 use crate::search::{SearchMode, SearchResult};
@@ -544,9 +544,10 @@ fn handle_tool_status(
         .unwrap_or_else(|_| Path::new(path_str).to_path_buf());
 
     let index_dir = config.project_index_dir(&project_path);
-    let index_path = index_dir.join("index.json");
+    // Check for v2 bincode index first, fall back to v1 JSON index
+    let index_exists = index_dir.join("index.bin").exists() || index_dir.join("index.json").exists();
 
-    let message = if !index_path.exists() {
+    let message = if !index_exists {
         format!(
             "No index found for {}.\n\
              Run `seekr-code index {}` to build one.",
@@ -641,12 +642,27 @@ fn execute_search(
                 search_semantic(index, query, embedder.as_ref(), &semantic_options)
                     .map_err(|e| e.to_string())?;
 
-            Ok(rrf_fuse(
-                &text_results,
-                &semantic_results,
-                config.search.rrf_k,
-                top_k,
-            ))
+            // Try AST pattern search — silently degrade if query isn't a valid AST pattern
+            let ast_results = search_ast_pattern(index, query, top_k).unwrap_or_default();
+
+            if ast_results.is_empty() {
+                // 2-way fusion when no AST matches
+                Ok(rrf_fuse(
+                    &text_results,
+                    &semantic_results,
+                    config.search.rrf_k,
+                    top_k,
+                ))
+            } else {
+                // 3-way fusion with AST
+                Ok(rrf_fuse_three(
+                    &text_results,
+                    &semantic_results,
+                    &ast_results,
+                    config.search.rrf_k,
+                    top_k,
+                ))
+            }
         }
         SearchMode::Ast => {
             let results = search_ast_pattern(index, query, top_k)
