@@ -10,6 +10,12 @@ repository = "https://github.com/lucientong/seekr"
 readme = "README.md"
 keywords = ["search", "code", "semantic", "ast", "grep"]
 categories = ["command-line-utilities", "development-tools"]
+exclude = [
+    "tests/",
+    "ARCHITECTURE.md",
+    "ARCHITECTURE_CN.md",
+    ".github/",
+]
 
 [[bin]]
 name = "seekr-code"
