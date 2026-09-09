@@ -4,6 +4,7 @@
 //! index building orchestration, and status display.
 
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Instant;
 
 use colored::Colorize;
@@ -20,12 +21,7 @@ use crate::parser::chunker::chunk_file_from_path;
 use crate::parser::summary::generate_summary;
 use crate::scanner::filter::should_index_file;
 use crate::scanner::walker::walk_directory;
-use crate::search::ast_pattern::{looks_like_ast_pattern, search_ast_pattern};
-use crate::search::fusion::{
-    fuse_ast_only, fuse_semantic_only, fuse_text_only, rrf_fuse, rrf_fuse_three,
-};
-use crate::search::semantic::{SemanticSearchOptions, search_semantic};
-use crate::search::text::{TextSearchOptions, search_text_regex};
+use crate::search::engine::{SearchEngine, SearchOptions};
 use crate::search::{SearchMode, SearchQuery, SearchResponse, SearchResult};
 
 /// Execute the `seekr-code index` command.
@@ -362,95 +358,35 @@ pub fn cmd_search(
         );
     })?;
 
-    // Execute search based on mode
-    let fused_results = match &search_mode {
-        SearchMode::Text => {
-            let options = TextSearchOptions {
-                case_sensitive: false,
-                context_lines: config.search.context_lines,
-                top_k,
-            };
-            let text_results = search_text_regex(&index, query, &options)?;
-            fuse_text_only(&text_results, top_k)
-        }
-        SearchMode::Semantic => {
-            let embedder = create_embedder_for_search(config)?;
-            let options = SemanticSearchOptions {
-                top_k,
-                score_threshold: config.search.score_threshold,
-            };
-            let semantic_results = search_semantic(&index, query, embedder.as_ref(), &options)?;
-            fuse_semantic_only(&semantic_results, top_k)
-        }
-        SearchMode::Hybrid => {
-            // Run text, semantic, and AST search, then fuse with 3-way RRF
-            let text_options = TextSearchOptions {
-                case_sensitive: false,
-                context_lines: config.search.context_lines,
-                top_k,
-            };
-            let text_results = search_text_regex(&index, query, &text_options)?;
-
-            let embedder = create_embedder_for_search(config)?;
-            let semantic_options = SemanticSearchOptions {
-                top_k,
-                score_threshold: config.search.score_threshold,
-            };
-            let semantic_results =
-                search_semantic(&index, query, embedder.as_ref(), &semantic_options)?;
-
-            let ast_results = if looks_like_ast_pattern(query) {
-                search_ast_pattern(&index, query, top_k).unwrap_or_default()
-            } else {
-                Vec::new()
-            };
-
-            if ast_results.is_empty() {
-                // 2-way fusion when no AST matches
-                rrf_fuse(&text_results, &semantic_results, config.search.rrf_k, top_k)
-            } else {
-                // 3-way fusion with AST
-                rrf_fuse_three(
-                    &text_results,
-                    &semantic_results,
-                    &ast_results,
-                    config.search.rrf_k,
-                    top_k,
-                )
-            }
-        }
-        SearchMode::Ast => {
-            let ast_results = search_ast_pattern(&index, query, top_k)?;
-            if ast_results.is_empty() && !json_output {
-                eprintln!(
-                    "{} No AST pattern matches found for '{}'",
-                    "⚠".yellow(),
-                    query,
-                );
-                eprintln!(
-                    "  {} Pattern syntax: fn(string) -> number, async fn(*) -> Result, struct *Config",
-                    "ℹ".blue(),
-                );
-            }
-            fuse_ast_only(&ast_results, top_k)
-        }
+    let embedder = if matches!(search_mode, SearchMode::Semantic | SearchMode::Hybrid) {
+        Some(Arc::from(create_embedder_for_search(config)?))
+    } else {
+        None
     };
+    let engine = SearchEngine::new(config.search.clone(), embedder);
+    let results = engine.search(
+        &index,
+        query,
+        search_mode.clone(),
+        &SearchOptions {
+            top_k,
+            ..SearchOptions::default()
+        },
+    )?;
+
+    if search_mode == SearchMode::Ast && results.is_empty() && !json_output {
+        eprintln!(
+            "{} No AST pattern matches found for '{}'",
+            "⚠".yellow(),
+            query
+        );
+        eprintln!(
+            "  {} Pattern syntax: fn(string) -> number, async fn(*) -> Result, struct *Config",
+            "ℹ".blue(),
+        );
+    }
 
     let elapsed = start.elapsed();
-
-    // Build response — propagate matched_lines from fusion results
-    let results: Vec<SearchResult> = fused_results
-        .iter()
-        .filter_map(|fused| {
-            index.get_chunk(fused.chunk_id).map(|chunk| SearchResult {
-                chunk: chunk.clone(),
-                score: fused.fused_score,
-                source: search_mode.clone(),
-                matched_lines: fused.matched_lines.clone(),
-            })
-        })
-        .collect();
-
     let total = results.len();
 
     if json_output {

@@ -10,6 +10,7 @@
 
 use std::io::{BufRead, Write};
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
@@ -24,12 +25,7 @@ use crate::parser::chunker::chunk_file_from_path;
 use crate::parser::summary::generate_summary;
 use crate::scanner::filter::should_index_file;
 use crate::scanner::walker::walk_directory;
-use crate::search::ast_pattern::{looks_like_ast_pattern, search_ast_pattern};
-use crate::search::fusion::{
-    fuse_ast_only, fuse_semantic_only, fuse_text_only, rrf_fuse, rrf_fuse_three,
-};
-use crate::search::semantic::{SemanticSearchOptions, search_semantic};
-use crate::search::text::{TextSearchOptions, search_text_regex};
+use crate::search::engine::{SearchEngine, SearchOptions};
 use crate::search::{SearchMode, SearchResult};
 
 // ============================================================
@@ -257,6 +253,15 @@ fn handle_tools_list(request: &JsonRpcRequest) -> JsonRpcResponse {
                             "type": "string",
                             "description": "Absolute or relative path to the project directory to search in.",
                             "default": "."
+                        },
+                        "path_prefix": {
+                            "type": "string",
+                            "description": "Optional path prefix relative to the project root."
+                        },
+                        "languages": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "Optional language names to include."
                         }
                     },
                     "required": ["query"]
@@ -357,6 +362,21 @@ fn handle_tool_search(
         .get("project_path")
         .and_then(|v| v.as_str())
         .unwrap_or(".");
+    let path_prefix = arguments
+        .get("path_prefix")
+        .and_then(|v| v.as_str())
+        .map(Path::new);
+    let languages = arguments
+        .get("languages")
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_default();
 
     if query.is_empty() {
         return JsonRpcResponse::error(id, ERROR_INVALID_REQUEST, "Missing query".to_string());
@@ -385,24 +405,29 @@ fn handle_tool_search(
 
     let start = Instant::now();
 
-    let fused_results = match execute_search(&search_mode, query, &index, config, top_k) {
+    let path_prefix = path_prefix.map(|prefix| {
+        if prefix.is_absolute() {
+            prefix.to_path_buf()
+        } else {
+            project_path.join(prefix)
+        }
+    });
+    let results = match execute_search(
+        &search_mode,
+        query,
+        &index,
+        config,
+        SearchOptions {
+            top_k,
+            path_prefix,
+            languages,
+        },
+    ) {
         Ok(results) => results,
         Err(e) => return JsonRpcResponse::error(id, ERROR_INTERNAL, e),
     };
 
     let elapsed = start.elapsed();
-
-    let results: Vec<SearchResult> = fused_results
-        .iter()
-        .filter_map(|fused| {
-            index.get_chunk(fused.chunk_id).map(|chunk| SearchResult {
-                chunk: chunk.clone(),
-                score: fused.fused_score,
-                source: search_mode.clone(),
-                matched_lines: fused.matched_lines.clone(),
-            })
-        })
-        .collect();
 
     // Format results as MCP content
     let content = format_results_for_mcp(&results, elapsed.as_millis() as u64);
@@ -613,84 +638,21 @@ fn handle_tool_status(
 // Shared helpers
 // ============================================================
 
-use crate::search::fusion::FusedResult;
-
-/// Execute search across different modes — shared by MCP and HTTP.
 fn execute_search(
     mode: &SearchMode,
     query: &str,
     index: &SeekrIndex,
     config: &SeekrConfig,
-    top_k: usize,
-) -> Result<Vec<FusedResult>, String> {
-    match mode {
-        SearchMode::Text => {
-            let options = TextSearchOptions {
-                case_sensitive: false,
-                context_lines: config.search.context_lines,
-                top_k,
-            };
-            let results = search_text_regex(index, query, &options).map_err(|e| e.to_string())?;
-            Ok(fuse_text_only(&results, top_k))
-        }
-        SearchMode::Semantic => {
-            let embedder = create_embedder(config)?;
-            let options = SemanticSearchOptions {
-                top_k,
-                score_threshold: config.search.score_threshold,
-            };
-            let results = search_semantic(index, query, embedder.as_ref(), &options)
-                .map_err(|e| e.to_string())?;
-            Ok(fuse_semantic_only(&results, top_k))
-        }
-        SearchMode::Hybrid => {
-            let text_options = TextSearchOptions {
-                case_sensitive: false,
-                context_lines: config.search.context_lines,
-                top_k,
-            };
-            let text_results =
-                search_text_regex(index, query, &text_options).map_err(|e| e.to_string())?;
-
-            let embedder = create_embedder(config)?;
-            let semantic_options = SemanticSearchOptions {
-                top_k,
-                score_threshold: config.search.score_threshold,
-            };
-            let semantic_results =
-                search_semantic(index, query, embedder.as_ref(), &semantic_options)
-                    .map_err(|e| e.to_string())?;
-
-            let ast_results = if looks_like_ast_pattern(query) {
-                search_ast_pattern(index, query, top_k).unwrap_or_default()
-            } else {
-                Vec::new()
-            };
-
-            if ast_results.is_empty() {
-                // 2-way fusion when no AST matches
-                Ok(rrf_fuse(
-                    &text_results,
-                    &semantic_results,
-                    config.search.rrf_k,
-                    top_k,
-                ))
-            } else {
-                // 3-way fusion with AST
-                Ok(rrf_fuse_three(
-                    &text_results,
-                    &semantic_results,
-                    &ast_results,
-                    config.search.rrf_k,
-                    top_k,
-                ))
-            }
-        }
-        SearchMode::Ast => {
-            let results = search_ast_pattern(index, query, top_k).map_err(|e| e.to_string())?;
-            Ok(fuse_ast_only(&results, top_k))
-        }
-    }
+    options: SearchOptions,
+) -> Result<Vec<SearchResult>, String> {
+    let embedder = if matches!(mode, SearchMode::Semantic | SearchMode::Hybrid) {
+        Some(Arc::from(create_embedder(config)?))
+    } else {
+        None
+    };
+    SearchEngine::new(config.search.clone(), embedder)
+        .search(index, query, mode.clone(), &options)
+        .map_err(|e| e.to_string())
 }
 
 /// Create the production ONNX embedder.

@@ -98,6 +98,7 @@ pub fn rrf_fuse(
         b.fused_score
             .partial_cmp(&a.fused_score)
             .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.chunk_id.cmp(&b.chunk_id))
     });
 
     // Truncate to top-k
@@ -185,6 +186,7 @@ pub fn rrf_fuse_three(
         b.fused_score
             .partial_cmp(&a.fused_score)
             .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.chunk_id.cmp(&b.chunk_id))
     });
 
     fused.truncate(top_k);

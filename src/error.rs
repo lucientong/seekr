@@ -127,6 +127,9 @@ pub enum SearchError {
     #[error("Invalid AST pattern: {0}")]
     InvalidAstPattern(String),
 
+    #[error("Semantic search requires an embedder")]
+    EmbedderUnavailable,
+
     #[error("Index error: {0}")]
     Index(#[from] IndexError),
 

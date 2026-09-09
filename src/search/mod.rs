@@ -4,6 +4,7 @@
 //! and RRF fusion ranking across multiple search backends.
 
 pub mod ast_pattern;
+pub mod engine;
 pub mod fusion;
 pub mod semantic;
 pub mod text;

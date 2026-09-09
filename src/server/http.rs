@@ -25,13 +25,8 @@ use crate::parser::chunker::chunk_file_from_path;
 use crate::parser::summary::generate_summary;
 use crate::scanner::filter::should_index_file;
 use crate::scanner::walker::walk_directory;
-use crate::search::ast_pattern::{looks_like_ast_pattern, search_ast_pattern};
-use crate::search::fusion::{
-    fuse_ast_only, fuse_semantic_only, fuse_text_only, rrf_fuse, rrf_fuse_three,
-};
-use crate::search::semantic::{SemanticSearchOptions, search_semantic};
-use crate::search::text::{TextSearchOptions, search_text_regex};
-use crate::search::{SearchMode, SearchQuery, SearchResponse, SearchResult};
+use crate::search::engine::{SearchEngine, SearchOptions};
+use crate::search::{SearchMode, SearchQuery, SearchResponse};
 
 /// Shared application state for HTTP handlers.
 pub struct AppState {
@@ -59,6 +54,14 @@ pub struct SearchRequest {
     /// Project path to search in.
     #[serde(default = "default_path")]
     pub project_path: String,
+
+    /// Optional path prefix relative to the project root.
+    #[serde(default)]
+    pub path_prefix: Option<String>,
+
+    /// Optional language names to include.
+    #[serde(default)]
+    pub languages: Vec<String>,
 }
 
 fn default_mode() -> String {
@@ -218,144 +221,60 @@ async fn handle_search(
         )
     })?;
 
-    // Execute search
-    let top_k = req.top_k;
-    let fused_results = match &search_mode {
-        SearchMode::Text => {
-            let options = TextSearchOptions {
-                case_sensitive: false,
-                context_lines: config.search.context_lines,
-                top_k,
-            };
-            let text_results = search_text_regex(&index, &req.query, &options).map_err(|e| {
-                (
-                    StatusCode::BAD_REQUEST,
-                    Json(ErrorResponse {
-                        error: "Search failed".to_string(),
-                        details: Some(e.to_string()),
-                    }),
-                )
-            })?;
-            fuse_text_only(&text_results, top_k)
-        }
-        SearchMode::Semantic => {
-            let embedder = create_embedder(config).map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ErrorResponse {
-                        error: "Embedder unavailable".to_string(),
-                        details: Some(e.to_string()),
-                    }),
-                )
-            })?;
-            let options = SemanticSearchOptions {
-                top_k,
-                score_threshold: config.search.score_threshold,
-            };
-            let results = search_semantic(&index, &req.query, embedder.as_ref(), &options)
-                .map_err(|e| {
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(ErrorResponse {
-                            error: "Semantic search failed".to_string(),
-                            details: Some(e.to_string()),
-                        }),
-                    )
-                })?;
-            fuse_semantic_only(&results, top_k)
-        }
-        SearchMode::Hybrid => {
-            let text_options = TextSearchOptions {
-                case_sensitive: false,
-                context_lines: config.search.context_lines,
-                top_k,
-            };
-            let text_results =
-                search_text_regex(&index, &req.query, &text_options).map_err(|e| {
-                    (
-                        StatusCode::BAD_REQUEST,
-                        Json(ErrorResponse {
-                            error: "Text search failed".to_string(),
-                            details: Some(e.to_string()),
-                        }),
-                    )
-                })?;
-
-            let embedder = create_embedder(config).map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ErrorResponse {
-                        error: "Embedder unavailable".to_string(),
-                        details: Some(e.to_string()),
-                    }),
-                )
-            })?;
-            let semantic_options = SemanticSearchOptions {
-                top_k,
-                score_threshold: config.search.score_threshold,
-            };
-            let semantic_results =
-                search_semantic(&index, &req.query, embedder.as_ref(), &semantic_options).map_err(
-                    |e| {
-                        (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            Json(ErrorResponse {
-                                error: "Semantic search failed".to_string(),
-                                details: Some(e.to_string()),
-                            }),
-                        )
-                    },
-                )?;
-
-            let ast_results = if looks_like_ast_pattern(&req.query) {
-                search_ast_pattern(&index, &req.query, top_k).unwrap_or_default()
-            } else {
-                Vec::new()
-            };
-
-            if ast_results.is_empty() {
-                // 2-way fusion when no AST matches
-                rrf_fuse(&text_results, &semantic_results, config.search.rrf_k, top_k)
-            } else {
-                // 3-way fusion with AST
-                rrf_fuse_three(
-                    &text_results,
-                    &semantic_results,
-                    &ast_results,
-                    config.search.rrf_k,
-                    top_k,
-                )
-            }
-        }
-        SearchMode::Ast => {
-            let ast_results = search_ast_pattern(&index, &req.query, top_k).map_err(|e| {
-                (
-                    StatusCode::BAD_REQUEST,
-                    Json(ErrorResponse {
-                        error: "AST pattern search failed".to_string(),
-                        details: Some(e.to_string()),
-                    }),
-                )
-            })?;
-            fuse_ast_only(&ast_results, top_k)
-        }
+    let embedder = if matches!(search_mode, SearchMode::Semantic | SearchMode::Hybrid) {
+        Some(Arc::from(create_embedder(config).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: "Embedder unavailable".to_string(),
+                    details: Some(e),
+                }),
+            )
+        })?))
+    } else {
+        None
     };
+    let path_prefix = req.path_prefix.as_ref().map(|prefix| {
+        let path = Path::new(prefix);
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            project_path.join(path)
+        }
+    });
+    let engine = SearchEngine::new(config.search.clone(), embedder);
+    let top_k = req.top_k;
+    let results = engine
+        .search(
+            &index,
+            &req.query,
+            search_mode.clone(),
+            &SearchOptions {
+                top_k,
+                path_prefix,
+                languages: req.languages,
+            },
+        )
+        .map_err(|e| {
+            let status = if matches!(
+                e,
+                crate::error::SearchError::Embedder(_)
+                    | crate::error::SearchError::EmbedderUnavailable
+            ) {
+                StatusCode::INTERNAL_SERVER_ERROR
+            } else {
+                StatusCode::BAD_REQUEST
+            };
+            (
+                status,
+                Json(ErrorResponse {
+                    error: "Search failed".to_string(),
+                    details: Some(e.to_string()),
+                }),
+            )
+        })?;
 
     let elapsed = start.elapsed();
-
-    // Build response — propagate matched_lines from fusion results
-    let results: Vec<SearchResult> = fused_results
-        .iter()
-        .filter_map(|fused| {
-            index.get_chunk(fused.chunk_id).map(|chunk| SearchResult {
-                chunk: chunk.clone(),
-                score: fused.fused_score,
-                source: search_mode.clone(),
-                matched_lines: fused.matched_lines.clone(),
-            })
-        })
-        .collect();
-
     let total = results.len();
 
     let response = SearchResponse {

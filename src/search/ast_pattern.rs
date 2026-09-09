@@ -164,6 +164,7 @@ pub fn search_ast_pattern(
         b.score
             .partial_cmp(&a.score)
             .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.chunk_id.cmp(&b.chunk_id))
     });
 
     matches.truncate(top_k);

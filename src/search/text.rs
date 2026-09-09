@@ -94,6 +94,7 @@ pub fn search_text_regex(
         b.score
             .partial_cmp(&a.score)
             .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.chunk_id.cmp(&b.chunk_id))
     });
 
     // Truncate to top-k
