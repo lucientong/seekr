@@ -89,9 +89,9 @@ impl OnnxEmbedder {
         let session = Session::builder()
             .map_err(|e| EmbedderError::OnnxError(e.to_string()))?
             .with_optimization_level(GraphOptimizationLevel::Level3)
-            .unwrap_or_else(|e| e.recover())
+            .map_err(|e| EmbedderError::OnnxError(e.to_string()))?
             .with_intra_threads(4)
-            .unwrap_or_else(|e| e.recover())
+            .map_err(|e| EmbedderError::OnnxError(e.to_string()))?
             .commit_from_file(&model_path)
             .map_err(|e| EmbedderError::OnnxError(format!("Failed to load model: {}", e)))?;
 
