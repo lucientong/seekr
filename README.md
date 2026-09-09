@@ -73,6 +73,9 @@ seekr-code search "fn.*authenticate" --mode text
 # Semantic search (search by meaning)
 seekr-code search "user login validation" --mode semantic
 
+# Agent-oriented search with final result and estimated token budgets
+seekr-code search "authentication flow" --max-results 8 --max-tokens 4000
+
 # AST pattern search
 seekr-code search "fn(*) -> Result" --mode ast
 seekr-code search "struct *Config" --mode ast

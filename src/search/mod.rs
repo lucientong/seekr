@@ -8,6 +8,7 @@ pub mod engine;
 pub mod fusion;
 pub mod semantic;
 pub mod text;
+pub mod token_budget;
 
 use crate::parser::CodeChunk;
 
@@ -37,6 +38,14 @@ pub struct SearchQuery {
     /// Maximum number of results to return.
     pub top_k: usize,
 
+    /// Optional final result count limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_results: Option<usize>,
+
+    /// Optional conservative estimated token budget.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<usize>,
+
     /// Project path to search in.
     pub project_path: String,
 }
@@ -63,8 +72,12 @@ pub struct SearchResponse {
     /// Search results, sorted by relevance.
     pub results: Vec<SearchResult>,
 
-    /// Total number of results before top-k truncation.
+    /// Total number of returned results.
     pub total: usize,
+
+    /// Conservative estimated token count of all returned results.
+    #[serde(default)]
+    pub estimated_tokens: usize,
 
     /// Search duration in milliseconds.
     pub duration_ms: u64,

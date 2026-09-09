@@ -241,8 +241,18 @@ fn handle_tools_list(request: &JsonRpcRequest) -> JsonRpcResponse {
                         },
                         "top_k": {
                             "type": "integer",
-                            "description": "Maximum number of results to return (default: 20).",
+                            "description": "Maximum number of candidates to retrieve (default: 20).",
                             "default": 20
+                        },
+                        "max_results": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "description": "Optional final result count limit. Cannot exceed top_k."
+                        },
+                        "max_tokens": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "description": "Optional conservative estimated token budget for returned results."
                         },
                         "project_path": {
                             "type": "string",
@@ -353,6 +363,14 @@ fn handle_tool_search(
         .get("top_k")
         .and_then(|v| v.as_u64())
         .unwrap_or(20) as usize;
+    let max_results = arguments
+        .get("max_results")
+        .and_then(|v| v.as_u64())
+        .map(|value| value as usize);
+    let max_tokens = arguments
+        .get("max_tokens")
+        .and_then(|v| v.as_u64())
+        .map(|value| value as usize);
     let project_path_str = arguments
         .get("project_path")
         .and_then(|v| v.as_str())
@@ -411,6 +429,8 @@ fn handle_tool_search(
         search_mode,
         &SearchOptions {
             top_k,
+            max_results,
+            max_tokens,
             path_prefix,
             languages,
         },
@@ -577,7 +597,13 @@ fn format_results_for_mcp(
         return "No results found.".to_string();
     }
 
-    let mut output = format!("Found {} results in {}ms:\n\n", results.len(), duration_ms);
+    let estimated_tokens = crate::search::token_budget::estimate_search_results_tokens(results);
+    let mut output = format!(
+        "Found {} results (~{} estimated tokens) in {}ms:\n\n",
+        results.len(),
+        estimated_tokens,
+        duration_ms
+    );
 
     for (i, result) in results.iter().enumerate() {
         let name = result.chunk.name.as_deref().unwrap_or("<unnamed>");
@@ -636,6 +662,21 @@ fn format_results_for_mcp(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn search_tool_schema_exposes_agent_limits() {
+        let request = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(Value::from(1)),
+            method: "tools/list".to_string(),
+            params: None,
+        };
+        let response = handle_tools_list(&request);
+        let search_schema = &response.result.unwrap()["tools"][0]["inputSchema"]["properties"];
+
+        assert_eq!(search_schema["max_results"]["type"], "integer");
+        assert_eq!(search_schema["max_tokens"]["type"], "integer");
+    }
 
     #[test]
     fn notifications_do_not_produce_responses() {

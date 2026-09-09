@@ -45,6 +45,14 @@ pub struct SearchRequest {
     #[serde(default = "default_top_k")]
     pub top_k: usize,
 
+    /// Optional final result count limit, capped by `top_k`.
+    #[serde(default)]
+    pub max_results: Option<usize>,
+
+    /// Optional conservative estimated token budget.
+    #[serde(default)]
+    pub max_tokens: Option<usize>,
+
     /// Project path to search in.
     #[serde(default = "default_path")]
     pub project_path: String,
@@ -228,12 +236,16 @@ async fn handle_search(
         }
     });
     let top_k = req.top_k;
+    let max_results = req.max_results;
+    let max_tokens = req.max_tokens;
     let results = engine
         .search_async(
             req.query.clone(),
             search_mode.clone(),
             SearchOptions {
                 top_k,
+                max_results,
+                max_tokens,
                 path_prefix,
                 languages: req.languages,
             },
@@ -257,15 +269,19 @@ async fn handle_search(
 
     let elapsed = start.elapsed();
     let total = results.len();
+    let estimated_tokens = crate::search::token_budget::estimate_search_results_tokens(&results);
 
     let response = SearchResponse {
         results,
         total,
+        estimated_tokens,
         duration_ms: elapsed.as_millis() as u64,
         query: SearchQuery {
             query: req.query,
             mode: search_mode,
             top_k,
+            max_results,
+            max_tokens,
             project_path: project_path.display().to_string(),
         },
     };
@@ -369,5 +385,20 @@ async fn handle_status(
             error: Some(e.to_string()),
             message: None,
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn search_request_remains_compatible_without_agent_limits() {
+        let request: SearchRequest =
+            serde_json::from_value(serde_json::json!({ "query": "authentication" })).unwrap();
+
+        assert_eq!(request.top_k, 20);
+        assert_eq!(request.max_results, None);
+        assert_eq!(request.max_tokens, None);
     }
 }

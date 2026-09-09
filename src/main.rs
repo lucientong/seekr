@@ -40,9 +40,17 @@ enum Commands {
         #[arg(short, long, default_value = "hybrid")]
         mode: String,
 
-        /// Maximum number of results
+        /// Maximum number of candidates to retrieve
         #[arg(short = 'k', long, default_value = "20")]
         top_k: usize,
+
+        /// Final result count limit (cannot exceed --top-k)
+        #[arg(long)]
+        max_results: Option<usize>,
+
+        /// Conservative estimated token budget for returned results
+        #[arg(long)]
+        max_tokens: Option<usize>,
 
         /// Project path to search in
         #[arg(short, long, default_value = ".")]
@@ -132,6 +140,8 @@ fn main() -> anyhow::Result<()> {
             query,
             mode,
             top_k,
+            max_results,
+            max_tokens,
             path,
             path_prefix,
             languages,
@@ -143,6 +153,8 @@ fn main() -> anyhow::Result<()> {
                 &path,
                 seekr_code::search::engine::SearchOptions {
                     top_k,
+                    max_results,
+                    max_tokens,
                     path_prefix: path_prefix.map(Into::into),
                     languages,
                 },

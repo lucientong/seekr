@@ -73,6 +73,9 @@ seekr-code search "fn.*authenticate" --mode text
 # 语义搜索（按含义查找）
 seekr-code search "用户登录验证" --mode semantic
 
+# 面向 Agent 的搜索：限制最终结果数量和估算 token 预算
+seekr-code search "认证流程" --max-results 8 --max-tokens 4000
+
 # AST 模式搜索
 seekr-code search "fn(*) -> Result" --mode ast
 seekr-code search "struct *Config" --mode ast

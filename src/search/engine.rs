@@ -14,11 +14,14 @@ use crate::search::fusion::{
 };
 use crate::search::semantic::{SemanticSearchOptions, search_semantic};
 use crate::search::text::{TextMatch, TextSearchOptions, search_text_regex};
+use crate::search::token_budget::apply_token_budget;
 use crate::search::{SearchMode, SearchResult};
 
 #[derive(Debug, Clone)]
 pub struct SearchOptions {
     pub top_k: usize,
+    pub max_results: Option<usize>,
+    pub max_tokens: Option<usize>,
     pub path_prefix: Option<PathBuf>,
     pub languages: Vec<String>,
 }
@@ -27,6 +30,8 @@ impl Default for SearchOptions {
     fn default() -> Self {
         Self {
             top_k: 20,
+            max_results: None,
+            max_tokens: None,
             path_prefix: None,
             languages: Vec::new(),
         }
@@ -64,7 +69,11 @@ impl SearchEngine {
             .map(|language| language.to_lowercase())
             .collect();
 
-        Ok(fused
+        let output_limit = options
+            .max_results
+            .unwrap_or(options.top_k)
+            .min(options.top_k);
+        let results = fused
             .into_iter()
             .filter_map(|result| {
                 let chunk = index.get_chunk(result.chunk_id)?;
@@ -84,8 +93,9 @@ impl SearchEngine {
                     matched_lines: result.matched_lines,
                 })
             })
-            .take(options.top_k)
-            .collect())
+            .take(output_limit)
+            .collect();
+        Ok(apply_token_budget(results, options.max_tokens))
     }
 
     fn search_fused(
@@ -217,6 +227,8 @@ mod tests {
                 SearchMode::Text,
                 &SearchOptions {
                     top_k: 10,
+                    max_results: None,
+                    max_tokens: None,
                     path_prefix: Some(PathBuf::from("src")),
                     languages: vec!["rust".to_string()],
                 },
@@ -252,5 +264,46 @@ mod tests {
             .expect("BM25 hybrid queries must not be parsed as regular expressions");
 
         assert!(results.iter().any(|result| result.chunk.id == 1));
+    }
+
+    #[test]
+    fn applies_result_and_token_limits_after_ranking() {
+        use crate::search::token_budget::estimate_search_result_tokens;
+
+        let chunks = vec![
+            chunk(1, "src/a.rs", "rust", "fn shared() {}"),
+            chunk(2, "src/b.rs", "rust", "fn shared() {}"),
+        ];
+        let index = SeekrIndex::build_from(&chunks, &[vec![1.0; 8], vec![1.0; 8]], 8);
+        let engine = SearchEngine::new(SearchConfig::default(), None);
+        let baseline = engine
+            .search(
+                &index,
+                "shared",
+                SearchMode::Text,
+                &SearchOptions {
+                    top_k: 2,
+                    ..SearchOptions::default()
+                },
+            )
+            .unwrap();
+        let first_result_budget = estimate_search_result_tokens(&baseline[0]);
+
+        let results = engine
+            .search(
+                &index,
+                "shared",
+                SearchMode::Text,
+                &SearchOptions {
+                    top_k: 2,
+                    max_results: Some(2),
+                    max_tokens: Some(first_result_budget),
+                    ..SearchOptions::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].chunk.id, baseline[0].chunk.id);
     }
 }

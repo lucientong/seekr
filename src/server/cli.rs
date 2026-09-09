@@ -131,6 +131,8 @@ pub fn cmd_search(
         }
     });
     let top_k = options.top_k;
+    let max_results = options.max_results;
+    let max_tokens = options.max_tokens;
     let results = engine.search(&index, query, search_mode.clone(), &options)?;
 
     if search_mode == SearchMode::Ast && results.is_empty() && !json_output {
@@ -147,16 +149,20 @@ pub fn cmd_search(
 
     let elapsed = start.elapsed();
     let total = results.len();
+    let estimated_tokens = crate::search::token_budget::estimate_search_results_tokens(&results);
 
     if json_output {
         let response = SearchResponse {
             results,
             total,
+            estimated_tokens,
             duration_ms: elapsed.as_millis() as u64,
             query: SearchQuery {
                 query: query.to_string(),
                 mode: search_mode,
                 top_k,
+                max_results,
+                max_tokens,
                 project_path: project_path.display().to_string(),
             },
         };
@@ -297,8 +303,9 @@ fn print_results_colored(
     }
 
     eprintln!(
-        "\n🔍 {} results in {:.1}ms\n",
+        "\n🔍 {} results · ~{} estimated tokens · {:.1}ms\n",
         results.len(),
+        crate::search::token_budget::estimate_search_results_tokens(results),
         elapsed.as_secs_f64() * 1000.0,
     );
 
