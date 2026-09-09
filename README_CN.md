@@ -215,6 +215,25 @@ rrf_k = 60
 batch_size = 32
 ```
 
+可以在 `<workspace>/.seekr.toml` 中配置项目级索引范围：
+
+```toml
+# 所有根目录必须位于 workspace 内部，嵌套根目录会自动去重。
+roots = ["packages/core", "packages/web"]
+
+# glob 均相对于 workspace 根目录。
+include = ["packages/**/*.rs", "packages/**/*.ts", "packages/**/*.tsx"]
+exclude = ["**/*.generated.rs", "**/fixtures/**"]
+
+# 可选的索引期语言白名单。
+languages = ["rust", "typescript", "tsx"]
+
+# 可选：覆盖全局文件大小上限。
+max_file_size = 5242880
+```
+
+无效 TOML、不支持的语言、缺失目录或 workspace 外部目录都会明确报错。CLI、HTTP、MCP 和 watch 模式共用同一份项目配置。
+
 ## 工作原理
 
 1. **扫描器（Scanner）** — 遍历项目目录，遵循 `.gitignore`，按文件类型/大小过滤

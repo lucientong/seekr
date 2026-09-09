@@ -1,5 +1,6 @@
 //! Unified full and incremental indexing application service.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -14,8 +15,9 @@ use crate::index::store::{SeekrIndex, tokenize_for_index_pub};
 use crate::parser::CodeChunk;
 use crate::parser::chunker::chunk_file_from_path;
 use crate::parser::summary::generate_summary;
+use crate::parser::treesitter::SupportedLanguage;
 use crate::scanner::filter::should_index_file;
-use crate::scanner::walker::walk_directory;
+use crate::scanner::walker::walk_workspace_root;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BuildStatus {
@@ -90,13 +92,34 @@ impl IndexBuilder {
             completed: 0,
             total: 0,
         });
-        let scan_result = walk_directory(&project_path, &self.config)?;
-        let file_paths: Vec<PathBuf> = scan_result
-            .entries
-            .iter()
-            .filter(|entry| should_index_file(&entry.path, entry.size, self.config.max_file_size))
-            .map(|entry| entry.path.clone())
+        let scan_config = self.config.scan_config(&project_path)?;
+        let mut entries = BTreeMap::new();
+        let mut files_skipped = 0;
+        for root in &scan_config.roots {
+            let scan_result = walk_workspace_root(root, &scan_config)?;
+            files_skipped += scan_result.skipped;
+            for entry in scan_result.entries {
+                match entry.path.canonicalize() {
+                    Ok(path) => {
+                        entries.entry(path).or_insert(entry);
+                    }
+                    Err(_) => files_skipped += 1,
+                }
+            }
+        }
+        let discovered_files = entries.len();
+        let file_paths: Vec<PathBuf> = entries
+            .into_iter()
+            .filter(|(path, entry)| {
+                should_index_file(path, entry.size, scan_config.max_file_size)
+                    && SupportedLanguage::from_path(path).is_some_and(|language| {
+                        scan_config.languages.is_empty()
+                            || scan_config.languages.contains(language.name())
+                    })
+            })
+            .map(|(path, _)| path)
             .collect();
+        files_skipped += discovered_files.saturating_sub(file_paths.len());
         let files_found = file_paths.len();
 
         let has_index =
@@ -125,7 +148,7 @@ impl IndexBuilder {
                 index_dir,
                 index: index.expect("incremental mode always loads an index"),
                 files_found,
-                files_skipped: scan_result.skipped,
+                files_skipped,
                 files_parsed: 0,
                 changed_files: 0,
                 unchanged_files: changes.unchanged.len(),
@@ -229,7 +252,7 @@ impl IndexBuilder {
             index_dir,
             index,
             files_found,
-            files_skipped: scan_result.skipped,
+            files_skipped,
             files_parsed,
             changed_files: files_to_process.len(),
             unchanged_files: changes.unchanged.len(),
@@ -278,5 +301,50 @@ mod tests {
         assert_eq!(third.status, BuildStatus::Empty);
         assert_eq!(third.deleted_files, 1);
         assert_eq!(third.index.chunk_count, 0);
+    }
+
+    #[test]
+    fn builds_deduplicated_multi_root_workspace_with_language_filter() {
+        let project = tempfile::tempdir().unwrap();
+        let index_root = tempfile::tempdir().unwrap();
+        let root_a = project.path().join("root-a");
+        let nested = root_a.join("nested");
+        let root_b = project.path().join("root-b");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::create_dir(&root_b).unwrap();
+        std::fs::write(root_a.join("a.rs"), "fn alpha() {}").unwrap();
+        std::fs::write(nested.join("nested.rs"), "fn nested() {}").unwrap();
+        std::fs::write(root_b.join("b.py"), "def beta():\n    pass\n").unwrap();
+        std::fs::write(root_b.join("ignored.js"), "function ignored() {}").unwrap();
+        std::fs::write(
+            project.path().join(".seekr.toml"),
+            r#"
+roots = ["root-a", "root-a/nested", "root-b"]
+languages = ["rust", "python"]
+"#,
+        )
+        .unwrap();
+        let config = SeekrConfig {
+            index_dir: index_root.path().to_path_buf(),
+            ..SeekrConfig::default()
+        };
+        let builder = IndexBuilder::new(config, Arc::new(DummyEmbedder::new(8)));
+
+        let report = builder.build(project.path(), false).unwrap();
+        let indexed_paths: std::collections::HashSet<_> = report
+            .index
+            .chunks
+            .values()
+            .map(|chunk| chunk.file_path.clone())
+            .collect();
+
+        assert_eq!(report.files_found, 3);
+        assert_eq!(indexed_paths.len(), 3);
+        assert!(indexed_paths.iter().all(|path| {
+            matches!(
+                SupportedLanguage::from_path(path),
+                Some(SupportedLanguage::Rust | SupportedLanguage::Python)
+            )
+        }));
     }
 }

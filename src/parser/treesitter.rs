@@ -31,6 +31,29 @@ pub enum SupportedLanguage {
 }
 
 impl SupportedLanguage {
+    /// Parse a canonical language name used by project configuration.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name.trim().to_lowercase().as_str() {
+            "rust" | "rs" => Some(Self::Rust),
+            "python" | "py" => Some(Self::Python),
+            "javascript" | "js" => Some(Self::JavaScript),
+            "typescript" | "ts" => Some(Self::TypeScript),
+            "tsx" => Some(Self::Tsx),
+            "go" => Some(Self::Go),
+            "java" => Some(Self::Java),
+            "c" => Some(Self::C),
+            "cpp" | "c++" => Some(Self::Cpp),
+            "json" => Some(Self::Json),
+            "toml" => Some(Self::Toml),
+            "yaml" | "yml" => Some(Self::Yaml),
+            "html" => Some(Self::Html),
+            "css" => Some(Self::Css),
+            "ruby" => Some(Self::Ruby),
+            "bash" | "shell" => Some(Self::Bash),
+            _ => None,
+        }
+    }
+
     /// Detect the language from a file extension.
     pub fn from_extension(ext: &str) -> Option<Self> {
         match ext.to_lowercase().as_str() {

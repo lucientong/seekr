@@ -215,6 +215,25 @@ rrf_k = 60
 batch_size = 32
 ```
 
+Project-specific indexing can be configured in `<workspace>/.seekr.toml`:
+
+```toml
+# All roots must remain inside the workspace. Nested roots are de-duplicated.
+roots = ["packages/core", "packages/web"]
+
+# Globs are relative to the workspace root.
+include = ["packages/**/*.rs", "packages/**/*.ts", "packages/**/*.tsx"]
+exclude = ["**/*.generated.rs", "**/fixtures/**"]
+
+# Optional index-time language whitelist.
+languages = ["rust", "typescript", "tsx"]
+
+# Optional override of the global byte limit.
+max_file_size = 5242880
+```
+
+Invalid TOML, unsupported languages, missing roots, and roots outside the workspace fail explicitly. All entry points, including watch mode, use the same workspace configuration.
+
 ## How It Works
 
 1. **Scanner** — Walks the project directory, respects `.gitignore`, filters by file type/size

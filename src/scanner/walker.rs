@@ -8,7 +8,7 @@ use std::sync::Mutex;
 
 use ignore::WalkBuilder;
 
-use crate::config::SeekrConfig;
+use crate::config::{ScanConfig, SeekrConfig};
 use crate::error::ScannerError;
 use crate::scanner::{ScanEntry, ScanResult};
 
@@ -16,6 +16,33 @@ use crate::scanner::{ScanEntry, ScanResult};
 ///
 /// Respects `.gitignore` rules and applies configured filters.
 pub fn walk_directory(root: &Path, config: &SeekrConfig) -> Result<ScanResult, ScannerError> {
+    walk_directory_with_patterns(
+        root,
+        root,
+        &[],
+        &config.exclude_patterns,
+        config.max_file_size,
+    )
+}
+
+/// Walk one validated workspace root with project-local scan settings.
+pub fn walk_workspace_root(root: &Path, config: &ScanConfig) -> Result<ScanResult, ScannerError> {
+    walk_directory_with_patterns(
+        root,
+        &config.workspace_root,
+        &config.include_patterns,
+        &config.exclude_patterns,
+        config.max_file_size,
+    )
+}
+
+fn walk_directory_with_patterns(
+    root: &Path,
+    pattern_base: &Path,
+    include_patterns: &[String],
+    exclude_patterns: &[String],
+    max_file_size: u64,
+) -> Result<ScanResult, ScannerError> {
     let start = std::time::Instant::now();
 
     let mut builder = WalkBuilder::new(root);
@@ -30,9 +57,14 @@ pub fn walk_directory(root: &Path, config: &SeekrConfig) -> Result<ScanResult, S
         .threads(num_cpus());
 
     // Add custom exclude overrides from config
-    let mut overrides_builder = ignore::overrides::OverrideBuilder::new(root);
-    for pattern in &config.exclude_patterns {
-        // Negate the pattern to make it an exclude
+    let mut overrides_builder = ignore::overrides::OverrideBuilder::new(pattern_base);
+    // Override globs invert gitignore syntax: plain patterns whitelist, `!` ignores.
+    for pattern in include_patterns {
+        overrides_builder.add(pattern).map_err(|e| {
+            ScannerError::FilterError(format!("Invalid include pattern '{}': {}", pattern, e))
+        })?;
+    }
+    for pattern in exclude_patterns {
         let exclude = format!("!{}", pattern);
         overrides_builder.add(&exclude).map_err(|e| {
             ScannerError::FilterError(format!("Invalid exclude pattern '{}': {}", pattern, e))
@@ -59,16 +91,16 @@ pub fn walk_directory(root: &Path, config: &SeekrConfig) -> Result<ScanResult, S
                         match dir_entry.metadata() {
                             Ok(metadata) => {
                                 let size = metadata.len();
-
-                                // Skip files exceeding the max size
-                                // (config.max_file_size accessed via closure would need Arc,
-                                //  for now we use a generous default)
-                                let scan_entry = ScanEntry {
-                                    path,
-                                    size,
-                                    modified: metadata.modified().ok(),
-                                };
-                                entries_mutex.lock().unwrap().push(scan_entry);
+                                if size <= max_file_size {
+                                    let scan_entry = ScanEntry {
+                                        path,
+                                        size,
+                                        modified: metadata.modified().ok(),
+                                    };
+                                    entries_mutex.lock().unwrap().push(scan_entry);
+                                } else {
+                                    *skipped_mutex.lock().unwrap() += 1;
+                                }
                             }
                             Err(_) => {
                                 *skipped_mutex.lock().unwrap() += 1;
@@ -134,6 +166,7 @@ fn num_cpus() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
 
     #[test]
     fn test_walk_simple() {
@@ -155,5 +188,27 @@ mod tests {
         let result = walk_directory(&root, &config).unwrap();
         assert!(!result.entries.is_empty());
         assert!(result.duration.as_secs() < 10, "Scan should be fast");
+    }
+
+    #[test]
+    fn workspace_patterns_apply_relative_to_workspace_root() {
+        let workspace = tempfile::tempdir().unwrap();
+        let core = workspace.path().join("core");
+        std::fs::create_dir(&core).unwrap();
+        std::fs::write(core.join("keep.rs"), "fn keep() {}").unwrap();
+        std::fs::write(core.join("skip.generated.rs"), "fn skip() {}").unwrap();
+        std::fs::write(core.join("other.py"), "def other(): pass").unwrap();
+        let config = ScanConfig {
+            workspace_root: workspace.path().to_path_buf(),
+            roots: vec![core.clone()],
+            include_patterns: vec!["core/**/*.rs".to_string()],
+            exclude_patterns: vec!["**/*.generated.rs".to_string()],
+            languages: HashSet::new(),
+            max_file_size: 1024,
+        };
+
+        let result = walk_workspace_root(&core, &config).unwrap();
+        assert_eq!(result.entries.len(), 1);
+        assert!(result.entries[0].path.ends_with("keep.rs"));
     }
 }

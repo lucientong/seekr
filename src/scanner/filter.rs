@@ -5,101 +5,13 @@
 
 use std::path::Path;
 
+use crate::parser::treesitter::SupportedLanguage;
+
 /// Maximum number of bytes to check for binary detection.
 const BINARY_CHECK_SIZE: usize = 8192;
 
 /// Percentage of null bytes threshold for binary detection.
 const BINARY_NULL_THRESHOLD: f64 = 0.01;
-
-/// Known source code file extensions.
-const SOURCE_EXTENSIONS: &[&str] = &[
-    // Rust
-    "rs",
-    // Python
-    "py",
-    "pyi",
-    "pyx",
-    // JavaScript / TypeScript
-    "js",
-    "jsx",
-    "mjs",
-    "cjs",
-    "ts",
-    "tsx",
-    "mts",
-    "cts",
-    // Go
-    "go",
-    // Java / Kotlin
-    "java",
-    "kt",
-    "kts",
-    // C / C++
-    "c",
-    "h",
-    "cc",
-    "cpp",
-    "cxx",
-    "hpp",
-    "hxx",
-    // C#
-    "cs",
-    // Ruby
-    "rb",
-    // PHP
-    "php",
-    // Swift
-    "swift",
-    // Scala
-    "scala",
-    // Shell
-    "sh",
-    "bash",
-    "zsh",
-    "fish",
-    // Web
-    "html",
-    "htm",
-    "css",
-    "scss",
-    "sass",
-    "less",
-    // Data / Config
-    "json",
-    "yaml",
-    "yml",
-    "toml",
-    "xml",
-    "ini",
-    "cfg",
-    // Markdown / Docs
-    "md",
-    "rst",
-    "txt",
-    // SQL
-    "sql",
-    // Lua
-    "lua",
-    // Dart
-    "dart",
-    // Elixir / Erlang
-    "ex",
-    "exs",
-    "erl",
-    // Haskell
-    "hs",
-    // OCaml
-    "ml",
-    "mli",
-    // Zig
-    "zig",
-    // Protobuf
-    "proto",
-    // Dockerfile
-    "dockerfile",
-    // Makefile
-    "makefile",
-];
 
 /// Check if a file is likely a binary file by examining its content.
 ///
@@ -130,25 +42,7 @@ pub fn is_binary_content(content: &[u8]) -> bool {
 
 /// Check if a file has a recognized source code extension.
 pub fn is_source_file(path: &Path) -> bool {
-    // Check for special filenames (no extension)
-    if let Some(filename) = path.file_name().and_then(|f| f.to_str()) {
-        let lower = filename.to_lowercase();
-        if matches!(
-            lower.as_str(),
-            "makefile" | "dockerfile" | "rakefile" | "gemfile" | "cmakelists.txt"
-        ) {
-            return true;
-        }
-    }
-
-    // Check extension
-    path.extension()
-        .and_then(|ext| ext.to_str())
-        .map(|ext| {
-            let lower = ext.to_lowercase();
-            SOURCE_EXTENSIONS.contains(&lower.as_str())
-        })
-        .unwrap_or(false)
+    SupportedLanguage::from_path(path).is_some()
 }
 
 /// Check if a file should be included for indexing.

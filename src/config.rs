@@ -5,6 +5,7 @@
 
 use crate::error::ConfigError;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 /// Default server port for HTTP API.
@@ -91,6 +92,45 @@ pub struct SearchConfig {
 pub struct EmbeddingConfig {
     /// Batch size for embedding computation.
     pub batch_size: usize,
+}
+
+/// Project-local indexing configuration loaded from `.seekr.toml`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WorkspaceConfig {
+    /// Workspace-relative directories to scan.
+    pub roots: Vec<PathBuf>,
+    /// Optional whitelist globs, relative to the workspace root.
+    pub include: Vec<String>,
+    /// Additional blacklist globs, relative to the workspace root.
+    pub exclude: Vec<String>,
+    /// Optional language whitelist.
+    pub languages: Vec<String>,
+    /// Optional project-specific maximum file size.
+    pub max_file_size: Option<u64>,
+}
+
+impl Default for WorkspaceConfig {
+    fn default() -> Self {
+        Self {
+            roots: vec![PathBuf::from(".")],
+            include: Vec::new(),
+            exclude: Vec::new(),
+            languages: Vec::new(),
+            max_file_size: None,
+        }
+    }
+}
+
+/// Validated scan settings formed by merging global and project config.
+#[derive(Debug, Clone)]
+pub struct ScanConfig {
+    pub workspace_root: PathBuf,
+    pub roots: Vec<PathBuf>,
+    pub include_patterns: Vec<String>,
+    pub exclude_patterns: Vec<String>,
+    pub languages: HashSet<String>,
+    pub max_file_size: u64,
 }
 
 impl Default for SeekrConfig {
@@ -199,6 +239,82 @@ impl SeekrConfig {
         let short_hash = &hex.as_str()[..16];
         self.index_dir.join(short_hash)
     }
+
+    /// Load and validate project-local scan settings.
+    pub fn scan_config(&self, workspace_root: &Path) -> Result<ScanConfig, ConfigError> {
+        let workspace_root = workspace_root.canonicalize()?;
+        let config_path = workspace_root.join(".seekr.toml");
+        let workspace = if config_path.exists() {
+            let content = std::fs::read_to_string(&config_path)?;
+            toml::from_str::<WorkspaceConfig>(&content)
+                .map_err(|error| ConfigError::ParseError(error.to_string()))?
+        } else {
+            WorkspaceConfig::default()
+        };
+        let configured_roots = if workspace.roots.is_empty() {
+            vec![PathBuf::from(".")]
+        } else {
+            workspace.roots
+        };
+        let mut roots = Vec::new();
+        for configured_root in configured_roots {
+            let candidate = if configured_root.is_absolute() {
+                configured_root
+            } else {
+                workspace_root.join(configured_root)
+            };
+            let root = candidate
+                .canonicalize()
+                .map_err(|error| ConfigError::InvalidValue {
+                    key: "roots".to_string(),
+                    reason: format!("cannot resolve '{}': {error}", candidate.display()),
+                })?;
+            if !root.starts_with(&workspace_root) {
+                return Err(ConfigError::InvalidValue {
+                    key: "roots".to_string(),
+                    reason: format!(
+                        "'{}' is outside workspace '{}'",
+                        root.display(),
+                        workspace_root.display()
+                    ),
+                });
+            }
+            if !root.is_dir() {
+                return Err(ConfigError::InvalidValue {
+                    key: "roots".to_string(),
+                    reason: format!("'{}' is not a directory", root.display()),
+                });
+            }
+            if !roots.contains(&root) {
+                roots.push(root);
+            }
+        }
+        roots.sort();
+
+        let mut languages = HashSet::new();
+        for language in &workspace.languages {
+            if language.trim().is_empty() {
+                continue;
+            }
+            let supported = crate::parser::treesitter::SupportedLanguage::from_name(language)
+                .ok_or_else(|| ConfigError::InvalidValue {
+                    key: "languages".to_string(),
+                    reason: format!("unsupported language '{language}'"),
+                })?;
+            languages.insert(supported.name().to_string());
+        }
+        let mut exclude_patterns = self.exclude_patterns.clone();
+        exclude_patterns.extend(workspace.exclude);
+
+        Ok(ScanConfig {
+            workspace_root,
+            roots,
+            include_patterns: workspace.include,
+            exclude_patterns,
+            languages,
+            max_file_size: workspace.max_file_size.unwrap_or(self.max_file_size),
+        })
+    }
 }
 
 /// Get the default Seekr data directory (`~/.seekr/`).
@@ -241,5 +357,55 @@ mod tests {
     fn test_load_nonexistent_returns_default() {
         let config = SeekrConfig::load_from(Path::new("/nonexistent/path/config.toml")).unwrap();
         assert_eq!(config.server.port, DEFAULT_PORT);
+    }
+
+    #[test]
+    fn loads_and_resolves_workspace_scan_config() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::create_dir(workspace.path().join("core")).unwrap();
+        std::fs::write(
+            workspace.path().join(".seekr.toml"),
+            r#"
+roots = ["core", "core"]
+include = ["core/**/*.rs"]
+exclude = ["**/*.generated.rs"]
+languages = ["rs", "python"]
+max_file_size = 1024
+"#,
+        )
+        .unwrap();
+
+        let scan = SeekrConfig::default()
+            .scan_config(workspace.path())
+            .unwrap();
+        assert_eq!(
+            scan.roots,
+            vec![workspace.path().join("core").canonicalize().unwrap()]
+        );
+        assert_eq!(scan.include_patterns, vec!["core/**/*.rs"]);
+        assert!(
+            scan.exclude_patterns
+                .contains(&"**/*.generated.rs".to_string())
+        );
+        assert_eq!(
+            scan.languages,
+            HashSet::from(["rust".to_string(), "python".to_string()])
+        );
+        assert_eq!(scan.max_file_size, 1024);
+    }
+
+    #[test]
+    fn rejects_workspace_roots_outside_project() {
+        let parent = tempfile::tempdir().unwrap();
+        let workspace = parent.path().join("workspace");
+        let outside = parent.path().join("outside");
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(workspace.join(".seekr.toml"), "roots = [\"../outside\"]").unwrap();
+
+        assert!(matches!(
+            SeekrConfig::default().scan_config(&workspace),
+            Err(ConfigError::InvalidValue { key, .. }) if key == "roots"
+        ));
     }
 }
