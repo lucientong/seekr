@@ -142,10 +142,13 @@ seekr-code serve --mcp
 **MCP 工具：**
 
 - `seekr_search` — 搜索代码，支持文本、语义、AST 和混合模式
+- `seekr_symbol_definition` — 查找所有同名定义候选
+- `seekr_symbols` — 浏览轻量级索引符号目录
 - `seekr_index` — 构建/重建搜索索引
 - `seekr_status` — 获取索引状态
 
 每个 MCP 连接会自动记录并排除已经返回过的代码块。
+符号工具仅执行轻量级索引查询，不提供编译器或 LSP 级解析。
 
 **MCP 配置示例**（Claude Desktop、CodeBuddy 等）：
 

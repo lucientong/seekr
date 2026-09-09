@@ -142,10 +142,13 @@ seekr-code serve --mcp
 **MCP Tools:**
 
 - `seekr_search` — Search code (text, semantic, AST, hybrid modes)
+- `seekr_symbol_definition` — Find all name-matched definition candidates
+- `seekr_symbols` — Browse the lightweight indexed symbol catalog
 - `seekr_index` — Build/rebuild the search index
 - `seekr_status` — Get index status
 
 `seekr_search` automatically suppresses repeated chunks for the lifetime of each MCP connection.
+Symbol tools are lightweight index lookups, not compiler- or LSP-grade resolution.
 
 **Example MCP configuration** (e.g., for Claude Desktop, CodeBuddy, etc.):
 

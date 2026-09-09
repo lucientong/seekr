@@ -4,7 +4,7 @@
 //! and an inverted text index for keyword search. Provides build, query, save,
 //! and load operations.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -12,6 +12,7 @@ use crate::INDEX_VERSION;
 use crate::error::IndexError;
 use crate::index::{IndexEntry, SearchHit};
 use crate::parser::CodeChunk;
+use crate::search::symbol::{SymbolSummary, is_indexable_symbol, normalize_symbol_name};
 
 // ============================================================
 // HNSW Point wrapper
@@ -90,6 +91,9 @@ pub struct SeekrIndex {
 
     #[serde(skip)]
     bm25_stats: OnceLock<Bm25Stats>,
+
+    #[serde(skip)]
+    symbol_index: OnceLock<HashMap<String, Vec<u64>>>,
 }
 
 impl std::fmt::Debug for SeekrIndex {
@@ -117,6 +121,7 @@ impl SeekrIndex {
             hnsw: OnceLock::new(),
             index_dir: None,
             bm25_stats: OnceLock::new(),
+            symbol_index: OnceLock::new(),
         }
     }
 
@@ -130,6 +135,7 @@ impl SeekrIndex {
     pub fn try_add_entry(&mut self, entry: IndexEntry, chunk: CodeChunk) -> Result<(), IndexError> {
         self.hnsw.take();
         self.bm25_stats.take();
+        self.symbol_index.take();
         let chunk_id = entry.chunk_id;
 
         if let Some(existing) = self.chunks.get(&chunk_id) {
@@ -172,6 +178,7 @@ impl SeekrIndex {
     pub fn remove_chunk(&mut self, chunk_id: u64) {
         self.hnsw.take();
         self.bm25_stats.take();
+        self.symbol_index.take();
         // Remove from vector index
         self.vectors.remove(&chunk_id);
 
@@ -452,6 +459,80 @@ impl SeekrIndex {
         });
         results.truncate(top_k);
         results
+    }
+
+    /// Return all name-based symbol definition candidates.
+    pub fn symbol_definitions(&self, name: &str) -> Vec<CodeChunk> {
+        let normalized = normalize_symbol_name(name);
+        if normalized.is_empty() {
+            return Vec::new();
+        }
+        let Some(chunk_ids) = self.ensure_symbol_index().get(&normalized) else {
+            return Vec::new();
+        };
+        let mut definitions: Vec<CodeChunk> = chunk_ids
+            .iter()
+            .filter_map(|chunk_id| self.chunks.get(chunk_id).cloned())
+            .collect();
+        definitions.sort_by(|left, right| {
+            left.file_path
+                .cmp(&right.file_path)
+                .then_with(|| left.line_range.start.cmp(&right.line_range.start))
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        definitions
+    }
+
+    /// List normalized symbols, optionally constrained by a name prefix.
+    pub fn symbols(&self, prefix: Option<&str>, limit: usize) -> Vec<SymbolSummary> {
+        let normalized_prefix = prefix.map(normalize_symbol_name).unwrap_or_default();
+        let mut symbols = Vec::new();
+        for (normalized_name, chunk_ids) in self.ensure_symbol_index() {
+            if !normalized_name.starts_with(&normalized_prefix) {
+                continue;
+            }
+            let mut names = BTreeSet::new();
+            let mut kinds = BTreeSet::new();
+            let mut languages = BTreeSet::new();
+            for chunk_id in chunk_ids {
+                if let Some(chunk) = self.chunks.get(chunk_id) {
+                    if let Some(name) = &chunk.name {
+                        names.insert(name.clone());
+                    }
+                    kinds.insert(chunk.kind.to_string());
+                    languages.insert(chunk.language.clone());
+                }
+            }
+            symbols.push(SymbolSummary {
+                normalized_name: normalized_name.clone(),
+                names: names.into_iter().collect(),
+                kinds: kinds.into_iter().collect(),
+                languages: languages.into_iter().collect(),
+                definition_count: chunk_ids.len(),
+            });
+        }
+        symbols.sort_by(|left, right| left.normalized_name.cmp(&right.normalized_name));
+        symbols.truncate(limit);
+        symbols
+    }
+
+    fn ensure_symbol_index(&self) -> &HashMap<String, Vec<u64>> {
+        self.symbol_index.get_or_init(|| {
+            let mut symbol_index: HashMap<String, Vec<u64>> = HashMap::new();
+            for (&chunk_id, chunk) in &self.chunks {
+                if !is_indexable_symbol(chunk) {
+                    continue;
+                }
+                let normalized = normalize_symbol_name(
+                    chunk.name.as_deref().expect("indexable symbols have names"),
+                );
+                symbol_index.entry(normalized).or_default().push(chunk_id);
+            }
+            for chunk_ids in symbol_index.values_mut() {
+                chunk_ids.sort_unstable();
+            }
+            symbol_index
+        })
     }
 
     /// Get a chunk by its ID.
@@ -824,5 +905,36 @@ mod tests {
             chunk,
         );
         assert_eq!(index.search_bm25("newly", 10)[0].chunk_id, 2);
+    }
+
+    #[test]
+    fn symbol_lookup_returns_all_candidates_in_stable_order() {
+        let mut second = make_test_chunk(2, "Shared", "fn Shared() {}");
+        second.file_path = PathBuf::from("src/b.rs");
+        let mut first = make_test_chunk(1, "shared", "fn shared() {}");
+        first.file_path = PathBuf::from("src/a.rs");
+        let mut index = SeekrIndex::build_from(&[second, first], &[vec![0.0; 2], vec![0.0; 2]], 2);
+
+        let definitions = index.symbol_definitions(" SHARED ");
+        assert_eq!(
+            definitions
+                .iter()
+                .map(|chunk| chunk.file_path.clone())
+                .collect::<Vec<_>>(),
+            vec![PathBuf::from("src/a.rs"), PathBuf::from("src/b.rs")]
+        );
+
+        index.remove_chunk(1);
+        assert_eq!(index.symbol_definitions("shared").len(), 1);
+        assert_eq!(index.symbols(Some("sha"), 10)[0].definition_count, 1);
+    }
+
+    #[test]
+    fn fallback_blocks_are_not_symbols() {
+        let mut chunk = make_test_chunk(1, "file.rs:L1-L20", "unparsed content");
+        chunk.kind = ChunkKind::Block;
+        let index = SeekrIndex::build_from(&[chunk], &[vec![0.0; 2]], 2);
+
+        assert!(index.symbol_definitions("file.rs:L1-L20").is_empty());
     }
 }

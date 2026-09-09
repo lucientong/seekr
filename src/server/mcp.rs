@@ -19,6 +19,7 @@ use crate::config::SeekrConfig;
 use crate::index::builder::BuildStatus;
 use crate::index::store::SeekrIndex;
 use crate::search::engine::SearchOptions;
+use crate::search::symbol::SymbolOptions;
 use crate::search::{SearchMode, SearchResult};
 use crate::server::state::EngineRegistry;
 
@@ -278,6 +279,58 @@ fn handle_tools_list(request: &JsonRpcRequest) -> JsonRpcResponse {
                 }
             },
             {
+                "name": "seekr_symbol_definition",
+                "description": "Find all indexed definitions sharing a normalized symbol name. This is lightweight name-based lookup, not compiler- or LSP-grade resolution.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "name": {
+                            "type": "string",
+                            "description": "Exact symbol name to find (case-insensitive)."
+                        },
+                        "project_path": {
+                            "type": "string",
+                            "description": "Project directory containing the index.",
+                            "default": "."
+                        },
+                        "path_prefix": {
+                            "type": "string",
+                            "description": "Optional path prefix relative to the project root."
+                        },
+                        "languages": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "Optional language names to include."
+                        }
+                    },
+                    "required": ["name"]
+                }
+            },
+            {
+                "name": "seekr_symbols",
+                "description": "List the lightweight name-based symbol catalog. Results are index-derived and are not compiler- or LSP-grade symbols.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "prefix": {
+                            "type": "string",
+                            "description": "Optional case-insensitive symbol name prefix."
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "default": 100,
+                            "description": "Maximum number of normalized symbols to return."
+                        },
+                        "project_path": {
+                            "type": "string",
+                            "description": "Project directory containing the index.",
+                            "default": "."
+                        }
+                    }
+                }
+            },
+            {
                 "name": "seekr_index",
                 "description": "Build or rebuild the code search index for a project. Scans source files, parses them into semantic chunks, generates embeddings, and builds a searchable index.",
                 "inputSchema": {
@@ -344,6 +397,10 @@ fn handle_tools_call(
 
     match tool_name {
         "seekr_search" => handle_tool_search(request.id.clone(), &arguments, registry, session_id),
+        "seekr_symbol_definition" => {
+            handle_tool_symbol_definition(request.id.clone(), &arguments, registry)
+        }
+        "seekr_symbols" => handle_tool_symbols(request.id.clone(), &arguments, registry),
         "seekr_index" => handle_tool_index(request.id.clone(), &arguments, registry),
         "seekr_status" => handle_tool_status(request.id.clone(), &arguments, registry.config()),
         _ => JsonRpcResponse::error(
@@ -476,6 +533,132 @@ fn handle_tool_search(
             }]
         }),
     )
+}
+
+fn handle_tool_symbol_definition(
+    id: Option<Value>,
+    arguments: &Value,
+    registry: &EngineRegistry,
+) -> JsonRpcResponse {
+    let name = arguments
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    if name.is_empty() {
+        return JsonRpcResponse::error(
+            id,
+            ERROR_INVALID_REQUEST,
+            "Missing symbol name".to_string(),
+        );
+    }
+    let project_path = resolve_project_path(arguments, "project_path");
+    let engine = match registry.get_or_create(&project_path) {
+        Ok(engine) => engine,
+        Err(error) => return JsonRpcResponse::error(id, ERROR_INTERNAL, error.to_string()),
+    };
+    let path_prefix = arguments
+        .get("path_prefix")
+        .and_then(Value::as_str)
+        .map(|prefix| {
+            let prefix = Path::new(prefix);
+            if prefix.is_absolute() {
+                prefix.to_path_buf()
+            } else {
+                project_path.join(prefix)
+            }
+        });
+    let languages = arguments
+        .get("languages")
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_default();
+    let definitions = match engine.symbol_definitions(
+        name,
+        &SymbolOptions {
+            path_prefix,
+            languages,
+        },
+    ) {
+        Ok(definitions) => definitions,
+        Err(error) => return JsonRpcResponse::error(id, ERROR_INTERNAL, error.to_string()),
+    };
+
+    let mut output = format!(
+        "Lightweight name-based lookup (not compiler/LSP resolution). Found {} definition candidate(s) for '{}':\n\n",
+        definitions.len(),
+        name
+    );
+    for (position, chunk) in definitions.iter().enumerate() {
+        output.push_str(&format!(
+            "[{}] {} {} in {} L{}-L{}\n",
+            position + 1,
+            chunk.kind,
+            chunk.name.as_deref().unwrap_or("<unnamed>"),
+            chunk.file_path.display(),
+            chunk.line_range.start + 1,
+            chunk.line_range.end
+        ));
+        if let Some(signature) = &chunk.signature {
+            output.push_str(&format!("    {signature}\n"));
+        }
+    }
+    JsonRpcResponse::success(
+        id,
+        serde_json::json!({ "content": [{ "type": "text", "text": output }] }),
+    )
+}
+
+fn handle_tool_symbols(
+    id: Option<Value>,
+    arguments: &Value,
+    registry: &EngineRegistry,
+) -> JsonRpcResponse {
+    let prefix = arguments.get("prefix").and_then(Value::as_str);
+    let limit = arguments
+        .get("limit")
+        .and_then(Value::as_u64)
+        .unwrap_or(100)
+        .clamp(1, 1_000) as usize;
+    let project_path = resolve_project_path(arguments, "project_path");
+    let engine = match registry.get_or_create(&project_path) {
+        Ok(engine) => engine,
+        Err(error) => return JsonRpcResponse::error(id, ERROR_INTERNAL, error.to_string()),
+    };
+    let symbols = match engine.symbols(prefix, limit) {
+        Ok(symbols) => symbols,
+        Err(error) => return JsonRpcResponse::error(id, ERROR_INTERNAL, error.to_string()),
+    };
+    let mut output = format!(
+        "Lightweight indexed symbol catalog (not compiler/LSP symbols). Found {} symbol(s):\n\n",
+        symbols.len()
+    );
+    for symbol in symbols {
+        output.push_str(&format!(
+            "- {} [{}] — {} definition(s), languages: {}\n",
+            symbol.names.join(" / "),
+            symbol.kinds.join(", "),
+            symbol.definition_count,
+            symbol.languages.join(", ")
+        ));
+    }
+    JsonRpcResponse::success(
+        id,
+        serde_json::json!({ "content": [{ "type": "text", "text": output }] }),
+    )
+}
+
+fn resolve_project_path(arguments: &Value, field: &str) -> std::path::PathBuf {
+    let path = arguments.get(field).and_then(Value::as_str).unwrap_or(".");
+    Path::new(path)
+        .canonicalize()
+        .unwrap_or_else(|_| Path::new(path).to_path_buf())
 }
 
 /// Handle `seekr_index` tool call.
@@ -695,6 +878,27 @@ mod tests {
 
         assert_eq!(search_schema["max_results"]["type"], "integer");
         assert_eq!(search_schema["max_tokens"]["type"], "integer");
+    }
+
+    #[test]
+    fn tool_schema_exposes_lightweight_symbol_navigation() {
+        let request = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(Value::from(1)),
+            method: "tools/list".to_string(),
+            params: None,
+        };
+        let response = handle_tools_list(&request);
+        let result = response.result.unwrap();
+        let names: Vec<&str> = result["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect();
+
+        assert!(names.contains(&"seekr_symbol_definition"));
+        assert!(names.contains(&"seekr_symbols"));
     }
 
     #[test]

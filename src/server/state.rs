@@ -12,7 +12,9 @@ use crate::embedder::traits::Embedder;
 use crate::error::{IndexError, SeekrError, ServerError};
 use crate::index::builder::{BuildStatus, IndexBuilder};
 use crate::index::store::SeekrIndex;
+use crate::parser::CodeChunk;
 use crate::search::engine::{SearchEngine, SearchOptions};
+use crate::search::symbol::{SymbolOptions, SymbolSummary};
 use crate::search::{SearchMode, SearchResult};
 use crate::server::session_dedup::SessionDedupStore;
 
@@ -94,6 +96,55 @@ impl ProjectEngine {
         SearchEngine::new(self.config.search.clone(), Some(Arc::clone(&self.embedder)))
             .search(&index, query, mode, options)
             .map_err(Into::into)
+    }
+
+    pub fn symbol_definitions(
+        &self,
+        name: &str,
+        options: &SymbolOptions,
+    ) -> Result<Vec<CodeChunk>, SeekrError> {
+        self.ensure_persisted_index()?;
+        let index = self
+            .index
+            .read()
+            .map_err(|error| ServerError::Internal(format!("Index lock poisoned: {error}")))?;
+        let languages: std::collections::HashSet<String> = options
+            .languages
+            .iter()
+            .map(|language| language.to_lowercase())
+            .collect();
+        Ok(index
+            .symbol_definitions(name)
+            .into_iter()
+            .filter(|chunk| {
+                options
+                    .path_prefix
+                    .as_ref()
+                    .is_none_or(|prefix| chunk.file_path.starts_with(prefix))
+                    && (languages.is_empty() || languages.contains(&chunk.language.to_lowercase()))
+            })
+            .collect())
+    }
+
+    pub fn symbols(
+        &self,
+        prefix: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<SymbolSummary>, SeekrError> {
+        self.ensure_persisted_index()?;
+        let index = self
+            .index
+            .read()
+            .map_err(|error| ServerError::Internal(format!("Index lock poisoned: {error}")))?;
+        Ok(index.symbols(prefix, limit))
+    }
+
+    fn ensure_persisted_index(&self) -> Result<(), SeekrError> {
+        if self.has_persisted_index.load(Ordering::Acquire) {
+            Ok(())
+        } else {
+            Err(IndexError::NotFound(self.config.project_index_dir(&self.project_path)).into())
+        }
     }
 
     pub fn build(&self, force: bool) -> Result<ProjectBuildReport, SeekrError> {
