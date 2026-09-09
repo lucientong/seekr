@@ -92,8 +92,8 @@ fn build_status_name(status: BuildStatus) -> &'static str {
 pub fn cmd_search(
     query: &str,
     mode: &str,
-    top_k: usize,
     project_path: &str,
+    mut options: SearchOptions,
     config: &SeekrConfig,
     json_output: bool,
 ) -> Result<(), SeekrError> {
@@ -123,15 +123,15 @@ pub fn cmd_search(
         None
     };
     let engine = SearchEngine::new(config.search.clone(), embedder);
-    let results = engine.search(
-        &index,
-        query,
-        search_mode.clone(),
-        &SearchOptions {
-            top_k,
-            ..SearchOptions::default()
-        },
-    )?;
+    options.path_prefix = options.path_prefix.map(|path| {
+        if path.is_absolute() {
+            path
+        } else {
+            project_path.join(path)
+        }
+    });
+    let top_k = options.top_k;
+    let results = engine.search(&index, query, search_mode.clone(), &options)?;
 
     if search_mode == SearchMode::Ast && results.is_empty() && !json_output {
         eprintln!(
@@ -165,9 +165,45 @@ pub fn cmd_search(
             serde_json::to_string_pretty(&response).unwrap_or_default()
         );
     } else {
-        print_results_colored(&results, &elapsed);
+        print_results_colored(&results, &elapsed, config.search.context_lines);
     }
 
+    Ok(())
+}
+
+pub fn cmd_clean(
+    project_path: &str,
+    config: &SeekrConfig,
+    json_output: bool,
+) -> Result<(), SeekrError> {
+    let project_path = Path::new(project_path)
+        .canonicalize()
+        .unwrap_or_else(|_| Path::new(project_path).to_path_buf());
+    let index_dir = config.project_index_dir(&project_path);
+    let removed = index_dir.exists();
+    if removed {
+        std::fs::remove_dir_all(&index_dir)?;
+    }
+
+    if json_output {
+        println!(
+            "{}",
+            serde_json::json!({
+                "status": "ok",
+                "project": project_path.display().to_string(),
+                "index_dir": index_dir.display().to_string(),
+                "removed": removed,
+            })
+        );
+    } else if removed {
+        eprintln!("{} Removed index at {}", "✓".green(), index_dir.display());
+    } else {
+        eprintln!(
+            "{} No index found for {}",
+            "ℹ".blue(),
+            project_path.display()
+        );
+    }
     Ok(())
 }
 
@@ -250,7 +286,11 @@ pub fn cmd_status(
 }
 
 /// Print search results with colored terminal output.
-fn print_results_colored(results: &[SearchResult], elapsed: &std::time::Duration) {
+fn print_results_colored(
+    results: &[SearchResult],
+    elapsed: &std::time::Duration,
+    context_lines: usize,
+) {
     if results.is_empty() {
         eprintln!("{} No results found.", "⚠".yellow());
         return;
@@ -283,8 +323,21 @@ fn print_results_colored(results: &[SearchResult], elapsed: &std::time::Duration
         let line_end = result.chunk.line_range.end;
         println!("    {} L{}-L{}", "│".dimmed(), line_start, line_end,);
 
-        // Show signature or first few lines of body
-        if let Some(ref sig) = result.chunk.signature {
+        if !result.matched_lines.is_empty() {
+            for (line, content, is_match) in crate::search::text::get_match_context(
+                &result.chunk,
+                &result.matched_lines,
+                context_lines,
+            ) {
+                let marker = if is_match { ">" } else { "│" };
+                let rendered = if is_match {
+                    content.red().bold()
+                } else {
+                    content.normal()
+                };
+                println!("  {} {:>5} {}", marker, line + 1, rendered);
+            }
+        } else if let Some(ref sig) = result.chunk.signature {
             println!("    {} {}", "│".dimmed(), sig.green());
         } else {
             // Show first 3 lines

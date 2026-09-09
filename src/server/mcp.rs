@@ -10,18 +10,17 @@
 
 use std::io::{BufRead, Write};
 use std::path::Path;
-use std::sync::Arc;
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::config::SeekrConfig;
-use crate::embedder::traits::Embedder;
-use crate::index::builder::{BuildStatus, IndexBuilder};
+use crate::index::builder::BuildStatus;
 use crate::index::store::SeekrIndex;
-use crate::search::engine::{SearchEngine, SearchOptions};
+use crate::search::engine::SearchOptions;
 use crate::search::{SearchMode, SearchResult};
+use crate::server::state::EngineRegistry;
 
 // ============================================================
 // JSON-RPC 2.0 types
@@ -108,6 +107,7 @@ pub fn run_mcp_stdio(config: &SeekrConfig) -> Result<(), crate::error::ServerErr
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     let mut stdout = stdout.lock();
+    let registry = EngineRegistry::new(config.clone());
 
     tracing::info!("MCP Server starting on stdio");
 
@@ -147,7 +147,7 @@ pub fn run_mcp_stdio(config: &SeekrConfig) -> Result<(), crate::error::ServerErr
             continue;
         }
 
-        if let Some(response) = handle_request(&request, config) {
+        if let Some(response) = handle_request(&request, &registry) {
             write_response(&mut stdout, &response);
         }
     }
@@ -165,7 +165,7 @@ fn write_response(writer: &mut impl Write, response: &JsonRpcResponse) {
 }
 
 /// Route an incoming MCP request to the appropriate handler.
-fn handle_request(request: &JsonRpcRequest, config: &SeekrConfig) -> Option<JsonRpcResponse> {
+fn handle_request(request: &JsonRpcRequest, registry: &EngineRegistry) -> Option<JsonRpcResponse> {
     if request.id.is_none() {
         match request.method.as_str() {
             "notifications/initialized" | "initialized" => {
@@ -185,7 +185,7 @@ fn handle_request(request: &JsonRpcRequest, config: &SeekrConfig) -> Option<Json
         "tools/list" => handle_tools_list(request),
 
         // MCP tool invocation
-        "tools/call" => handle_tools_call(request, config),
+        "tools/call" => handle_tools_call(request, registry),
 
         // Unknown method
         _ => JsonRpcResponse::error(
@@ -305,7 +305,7 @@ fn handle_tools_list(request: &JsonRpcRequest) -> JsonRpcResponse {
 // MCP Tools invocation
 // ============================================================
 
-fn handle_tools_call(request: &JsonRpcRequest, config: &SeekrConfig) -> JsonRpcResponse {
+fn handle_tools_call(request: &JsonRpcRequest, registry: &EngineRegistry) -> JsonRpcResponse {
     let params = match &request.params {
         Some(p) => p,
         None => {
@@ -324,9 +324,9 @@ fn handle_tools_call(request: &JsonRpcRequest, config: &SeekrConfig) -> JsonRpcR
         .unwrap_or(Value::Object(Default::default()));
 
     match tool_name {
-        "seekr_search" => handle_tool_search(request.id.clone(), &arguments, config),
-        "seekr_index" => handle_tool_index(request.id.clone(), &arguments, config),
-        "seekr_status" => handle_tool_status(request.id.clone(), &arguments, config),
+        "seekr_search" => handle_tool_search(request.id.clone(), &arguments, registry),
+        "seekr_index" => handle_tool_index(request.id.clone(), &arguments, registry),
+        "seekr_status" => handle_tool_status(request.id.clone(), &arguments, registry.config()),
         _ => JsonRpcResponse::error(
             request.id.clone(),
             ERROR_METHOD_NOT_FOUND,
@@ -339,7 +339,7 @@ fn handle_tools_call(request: &JsonRpcRequest, config: &SeekrConfig) -> JsonRpcR
 fn handle_tool_search(
     id: Option<Value>,
     arguments: &Value,
-    config: &SeekrConfig,
+    registry: &EngineRegistry,
 ) -> JsonRpcResponse {
     let query = arguments
         .get("query")
@@ -386,14 +386,13 @@ fn handle_tool_search(
         .canonicalize()
         .unwrap_or_else(|_| Path::new(project_path_str).to_path_buf());
 
-    let index_dir = config.project_index_dir(&project_path);
-    let index = match SeekrIndex::load(&index_dir) {
-        Ok(idx) => idx,
+    let engine = match registry.get_or_create(&project_path) {
+        Ok(engine) => engine,
         Err(e) => {
             return JsonRpcResponse::error(
                 id,
                 ERROR_INTERNAL,
-                format!("Failed to load index: {}. Run `seekr-code index` first.", e),
+                format!("Failed to load project engine: {e}"),
             );
         }
     };
@@ -407,25 +406,27 @@ fn handle_tool_search(
             project_path.join(prefix)
         }
     });
-    let results = match execute_search(
-        &search_mode,
+    let results = match engine.search(
         query,
-        &index,
-        config,
-        SearchOptions {
+        search_mode,
+        &SearchOptions {
             top_k,
             path_prefix,
             languages,
         },
     ) {
         Ok(results) => results,
-        Err(e) => return JsonRpcResponse::error(id, ERROR_INTERNAL, e),
+        Err(e) => return JsonRpcResponse::error(id, ERROR_INTERNAL, e.to_string()),
     };
 
     let elapsed = start.elapsed();
 
     // Format results as MCP content
-    let content = format_results_for_mcp(&results, elapsed.as_millis() as u64);
+    let content = format_results_for_mcp(
+        &results,
+        elapsed.as_millis() as u64,
+        registry.config().search.context_lines,
+    );
 
     JsonRpcResponse::success(
         id,
@@ -442,7 +443,7 @@ fn handle_tool_search(
 fn handle_tool_index(
     id: Option<Value>,
     arguments: &Value,
-    config: &SeekrConfig,
+    registry: &EngineRegistry,
 ) -> JsonRpcResponse {
     let path_str = arguments
         .get("path")
@@ -457,17 +458,17 @@ fn handle_tool_index(
         .canonicalize()
         .unwrap_or_else(|_| Path::new(path_str).to_path_buf());
 
-    let embedder = match create_embedder(config) {
-        Ok(embedder) => Arc::from(embedder),
+    let engine = match registry.get_or_create(&project_path) {
+        Ok(engine) => engine,
         Err(e) => {
             return JsonRpcResponse::error(
                 id,
                 ERROR_INTERNAL,
-                format!("Embedder creation failed: {}", e),
+                format!("Project engine creation failed: {}", e),
             );
         }
     };
-    let report = match IndexBuilder::new(config.clone(), embedder).build(&project_path, force) {
+    let report = match engine.build(force) {
         Ok(report) => report,
         Err(e) => {
             return JsonRpcResponse::error(id, ERROR_INTERNAL, format!("Indexing failed: {}", e));
@@ -488,8 +489,8 @@ fn handle_tool_index(
         },
         report.project_path.display(),
         report.files_parsed,
-        report.index.chunk_count,
-        report.index.embedding_dim,
+        report.chunk_count,
+        report.embedding_dim,
         report.duration.as_secs_f64(),
     );
 
@@ -566,36 +567,12 @@ fn handle_tool_status(
     )
 }
 
-// ============================================================
-// Shared helpers
-// ============================================================
-
-fn execute_search(
-    mode: &SearchMode,
-    query: &str,
-    index: &SeekrIndex,
-    config: &SeekrConfig,
-    options: SearchOptions,
-) -> Result<Vec<SearchResult>, String> {
-    let embedder = if matches!(mode, SearchMode::Semantic | SearchMode::Hybrid) {
-        Some(Arc::from(create_embedder(config)?))
-    } else {
-        None
-    };
-    SearchEngine::new(config.search.clone(), embedder)
-        .search(index, query, mode.clone(), &options)
-        .map_err(|e| e.to_string())
-}
-
-/// Create the production ONNX embedder.
-fn create_embedder(config: &SeekrConfig) -> Result<Box<dyn Embedder>, String> {
-    crate::embedder::onnx::OnnxEmbedder::new(&config.model_dir)
-        .map(|embedder| Box::new(embedder) as Box<dyn Embedder>)
-        .map_err(|e| e.to_string())
-}
-
 /// Format search results into a readable text block for MCP tool output.
-fn format_results_for_mcp(results: &[SearchResult], duration_ms: u64) -> String {
+fn format_results_for_mcp(
+    results: &[SearchResult],
+    duration_ms: u64,
+    context_lines: usize,
+) -> String {
     if results.is_empty() {
         return "No results found.".to_string();
     }
@@ -624,14 +601,32 @@ fn format_results_for_mcp(results: &[SearchResult], duration_ms: u64) -> String 
             output.push_str(&format!("  Signature: {}\n", sig));
         }
 
-        // Show first 5 lines of body
-        let body_preview: String = result
-            .chunk
-            .body
-            .lines()
-            .take(5)
-            .collect::<Vec<&str>>()
-            .join("\n");
+        let body_preview = if result.matched_lines.is_empty() {
+            result
+                .chunk
+                .body
+                .lines()
+                .take(5)
+                .collect::<Vec<&str>>()
+                .join("\n")
+        } else {
+            crate::search::text::get_match_context(
+                &result.chunk,
+                &result.matched_lines,
+                context_lines,
+            )
+            .into_iter()
+            .map(|(line, content, is_match)| {
+                format!(
+                    "{} {:>5} {}",
+                    if is_match { ">" } else { " " },
+                    line + 1,
+                    content
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+        };
         output.push_str(&format!("```\n{}\n```\n\n", body_preview));
     }
 
@@ -644,7 +639,7 @@ mod tests {
 
     #[test]
     fn notifications_do_not_produce_responses() {
-        let config = SeekrConfig::default();
+        let registry = EngineRegistry::new(SeekrConfig::default());
         for method in [
             "notifications/initialized",
             "initialized",
@@ -656,7 +651,7 @@ mod tests {
                 method: method.to_string(),
                 params: None,
             };
-            assert!(handle_request(&request, &config).is_none());
+            assert!(handle_request(&request, &registry).is_none());
         }
     }
 }

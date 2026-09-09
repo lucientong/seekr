@@ -17,15 +17,14 @@ use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 
 use crate::config::SeekrConfig;
-use crate::embedder::traits::Embedder;
-use crate::index::builder::IndexBuilder;
 use crate::index::store::SeekrIndex;
-use crate::search::engine::{SearchEngine, SearchOptions};
+use crate::search::engine::SearchOptions;
 use crate::search::{SearchMode, SearchQuery, SearchResponse};
+use crate::server::state::EngineRegistry;
 
 /// Shared application state for HTTP handlers.
 pub struct AppState {
-    pub config: SeekrConfig,
+    pub registry: EngineRegistry,
 }
 
 // ============================================================
@@ -135,7 +134,15 @@ pub async fn start_http_server(
     port: u16,
     config: SeekrConfig,
 ) -> Result<(), crate::error::ServerError> {
-    let state = Arc::new(AppState { config });
+    start_http_server_with_registry(host, port, EngineRegistry::new(config)).await
+}
+
+pub async fn start_http_server_with_registry(
+    host: &str,
+    port: u16,
+    registry: EngineRegistry,
+) -> Result<(), crate::error::ServerError> {
+    let state = Arc::new(AppState { registry });
 
     let app = Router::new()
         .route("/search", post(handle_search))
@@ -181,7 +188,6 @@ async fn handle_search(
     State(state): State<Arc<AppState>>,
     Json(req): Json<SearchRequest>,
 ) -> Result<Json<SearchResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let config = &state.config;
     let start = Instant::now();
 
     // Parse search mode
@@ -200,35 +206,19 @@ async fn handle_search(
         .canonicalize()
         .unwrap_or_else(|_| Path::new(&req.project_path).to_path_buf());
 
-    // Load index
-    let index_dir = config.project_index_dir(&project_path);
-    let index = SeekrIndex::load(&index_dir).map_err(|e| {
-        (
-            StatusCode::NOT_FOUND,
-            Json(ErrorResponse {
-                error: "Index not found".to_string(),
-                details: Some(format!(
-                    "No index at {}. Run `seekr-code index` first. Error: {}",
-                    index_dir.display(),
-                    e,
-                )),
-            }),
-        )
-    })?;
-
-    let embedder = if matches!(search_mode, SearchMode::Semantic | SearchMode::Hybrid) {
-        Some(Arc::from(create_embedder(config).map_err(|e| {
+    let engine = state
+        .registry
+        .get_or_create_async(project_path.clone())
+        .await
+        .map_err(|error| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse {
-                    error: "Embedder unavailable".to_string(),
-                    details: Some(e),
+                    error: "Project engine unavailable".to_string(),
+                    details: Some(error.to_string()),
                 }),
             )
-        })?))
-    } else {
-        None
-    };
+        })?;
     let path_prefix = req.path_prefix.as_ref().map(|prefix| {
         let path = Path::new(prefix);
         if path.is_absolute() {
@@ -237,34 +227,30 @@ async fn handle_search(
             project_path.join(path)
         }
     });
-    let engine = SearchEngine::new(config.search.clone(), embedder);
     let top_k = req.top_k;
     let results = engine
-        .search(
-            &index,
-            &req.query,
+        .search_async(
+            req.query.clone(),
             search_mode.clone(),
-            &SearchOptions {
+            SearchOptions {
                 top_k,
                 path_prefix,
                 languages: req.languages,
             },
         )
+        .await
         .map_err(|e| {
-            let status = if matches!(
-                e,
-                crate::error::SearchError::Embedder(_)
-                    | crate::error::SearchError::EmbedderUnavailable
-            ) {
-                StatusCode::INTERNAL_SERVER_ERROR
+            let details = e.to_string();
+            let status = if details.contains("Index not found") {
+                StatusCode::NOT_FOUND
             } else {
-                StatusCode::BAD_REQUEST
+                StatusCode::INTERNAL_SERVER_ERROR
             };
             (
                 status,
                 Json(ErrorResponse {
                     error: "Search failed".to_string(),
-                    details: Some(e.to_string()),
+                    details: Some(details),
                 }),
             )
         })?;
@@ -292,31 +278,31 @@ async fn handle_index(
     State(state): State<Arc<AppState>>,
     Json(req): Json<IndexRequest>,
 ) -> Result<Json<IndexResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let config = &state.config;
-
     let project_path = Path::new(&req.path)
         .canonicalize()
         .unwrap_or_else(|_| Path::new(&req.path).to_path_buf());
-    let embedder = create_embedder(config).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: "Embedder unavailable".to_string(),
-                details: Some(e),
-            }),
-        )
-    })?;
-    let report = IndexBuilder::new(config.clone(), Arc::from(embedder))
-        .build(&project_path, req.force)
+    let engine = state
+        .registry
+        .get_or_create_async(project_path)
+        .await
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse {
-                    error: "Indexing failed".to_string(),
+                    error: "Project engine unavailable".to_string(),
                     details: Some(e.to_string()),
                 }),
             )
         })?;
+    let report = engine.build_async(req.force).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: "Indexing failed".to_string(),
+                details: Some(e.to_string()),
+            }),
+        )
+    })?;
 
     Ok(Json(IndexResponse {
         status: match report.status {
@@ -326,9 +312,9 @@ async fn handle_index(
         }
         .to_string(),
         project: report.project_path.display().to_string(),
-        chunks: report.index.chunk_count,
+        chunks: report.chunk_count,
         files_parsed: report.files_parsed,
-        embedding_dim: report.index.embedding_dim,
+        embedding_dim: report.embedding_dim,
         duration_ms: report.duration.as_millis(),
     }))
 }
@@ -338,7 +324,7 @@ async fn handle_status(
     State(state): State<Arc<AppState>>,
     axum::extract::Query(query): axum::extract::Query<StatusQuery>,
 ) -> Json<StatusResponse> {
-    let config = &state.config;
+    let config = state.registry.config();
 
     let project_path = Path::new(&query.path)
         .canonicalize()
@@ -384,11 +370,4 @@ async fn handle_status(
             message: None,
         }),
     }
-}
-
-/// Create the production ONNX embedder.
-fn create_embedder(config: &SeekrConfig) -> Result<Box<dyn Embedder>, String> {
-    crate::embedder::onnx::OnnxEmbedder::new(&config.model_dir)
-        .map(|embedder| Box::new(embedder) as Box<dyn Embedder>)
-        .map_err(|e| e.to_string())
 }

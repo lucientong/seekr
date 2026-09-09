@@ -47,6 +47,14 @@ enum Commands {
         /// Project path to search in
         #[arg(short, long, default_value = ".")]
         path: String,
+
+        /// Only return files under this project-relative path
+        #[arg(long)]
+        path_prefix: Option<String>,
+
+        /// Only return these languages (repeatable)
+        #[arg(long = "language")]
+        languages: Vec<String>,
     },
 
     /// Build search index for a project
@@ -85,6 +93,13 @@ enum Commands {
         #[arg(default_value = ".")]
         path: String,
     },
+
+    /// Remove the stored index for a project
+    Clean {
+        /// Project path whose index should be removed
+        #[arg(default_value = ".")]
+        path: String,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -118,9 +133,22 @@ fn main() -> anyhow::Result<()> {
             mode,
             top_k,
             path,
+            path_prefix,
+            languages,
         } => {
             tracing::info!(query = %query, mode = %mode, top_k = top_k, path = %path, "Starting search");
-            seekr_code::server::cli::cmd_search(&query, &mode, top_k, &path, &config, cli.json)?;
+            seekr_code::server::cli::cmd_search(
+                &query,
+                &mode,
+                &path,
+                seekr_code::search::engine::SearchOptions {
+                    top_k,
+                    path_prefix: path_prefix.map(Into::into),
+                    languages,
+                },
+                &config,
+                cli.json,
+            )?;
         }
         Commands::Index { path, force } => {
             tracing::info!(path = %path, force = force, "Building index");
@@ -143,6 +171,8 @@ fn main() -> anyhow::Result<()> {
                 let rt = tokio::runtime::Runtime::new()
                     .map_err(|e| anyhow::anyhow!("Failed to create tokio runtime: {}", e))?;
                 rt.block_on(async {
+                    let registry = seekr_code::server::state::EngineRegistry::new(config.clone());
+
                     // If --watch is specified, spawn the watch daemon alongside the HTTP server
                     if let Some(watch_path) = watch {
                         let watch_dir =
@@ -152,37 +182,22 @@ fn main() -> anyhow::Result<()> {
                                     anyhow::anyhow!("Invalid watch path '{}': {}", watch_path, e)
                                 })?;
 
-                        // Load or create initial index for the watch path
-                        let index_dir = config.index_dir.join(
-                            watch_dir
-                                .file_name()
-                                .unwrap_or_default()
-                                .to_string_lossy()
-                                .as_ref(),
+                        let engine = registry
+                            .get_or_create_async(watch_dir.clone())
+                            .await
+                            .map_err(|e| anyhow::anyhow!("Failed to load watch project: {}", e))?;
+                        let initial = engine.clone().build_async(false).await.map_err(|e| {
+                            anyhow::anyhow!("Failed to initialize watch index: {}", e)
+                        })?;
+                        tracing::info!(
+                            chunks = initial.chunk_count,
+                            "Watch project index initialized"
                         );
-                        let index = match seekr_code::index::store::SeekrIndex::load(&index_dir) {
-                            Ok(idx) => idx,
-                            Err(_) => {
-                                tracing::info!(
-                                    "No existing index found, starting with empty index"
-                                );
-                                seekr_code::index::store::SeekrIndex::new(384)
-                            }
-                        };
-                        let shared_index = std::sync::Arc::new(tokio::sync::RwLock::new(index));
 
                         // Spawn watch daemon
-                        let daemon_config = config.clone();
-                        let daemon_index = shared_index.clone();
-                        let daemon_path = watch_dir.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = seekr_code::server::daemon::run_watch_daemon(
-                                &daemon_path,
-                                &daemon_config,
-                                daemon_index,
-                                None,
-                            )
-                            .await
+                            if let Err(e) =
+                                seekr_code::server::daemon::run_watch_daemon(engine, None).await
                             {
                                 tracing::error!("Watch daemon error: {}", e);
                             }
@@ -194,7 +209,7 @@ fn main() -> anyhow::Result<()> {
                         );
                     }
 
-                    seekr_code::server::http::start_http_server(&host, port, config)
+                    seekr_code::server::http::start_http_server_with_registry(&host, port, registry)
                         .await
                         .map_err(|e| anyhow::anyhow!("{}", e))
                 })?;
@@ -203,6 +218,10 @@ fn main() -> anyhow::Result<()> {
         Commands::Status { path } => {
             tracing::info!(path = %path, "Checking status");
             seekr_code::server::cli::cmd_status(&path, &config, cli.json)?;
+        }
+        Commands::Clean { path } => {
+            tracing::info!(path = %path, "Removing index");
+            seekr_code::server::cli::cmd_clean(&path, &config, cli.json)?;
         }
     }
 
