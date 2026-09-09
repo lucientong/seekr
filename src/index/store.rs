@@ -5,7 +5,8 @@
 //! and load operations.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use crate::INDEX_VERSION;
 use crate::error::IndexError;
@@ -20,8 +21,25 @@ use crate::parser::CodeChunk;
 ///
 /// Uses cosine distance (1 - cosine_similarity) as the distance metric,
 /// which is appropriate for L2-normalized embedding vectors.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 struct EmbeddingPoint(Vec<f32>);
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct HnswSidecar {
+    version: u32,
+    vector_fingerprint: [u8; 32],
+    hnsw: instant_distance::HnswMap<EmbeddingPoint, u64>,
+}
+
+#[derive(serde::Serialize)]
+struct HnswSidecarRef<'a> {
+    version: u32,
+    vector_fingerprint: [u8; 32],
+    hnsw: &'a instant_distance::HnswMap<EmbeddingPoint, u64>,
+}
+
+const HNSW_SIDECAR_VERSION: u32 = 1;
+const HNSW_FILENAME: &str = "hnsw.bin";
 
 impl instant_distance::Point for EmbeddingPoint {
     fn distance(&self, other: &Self) -> f32 {
@@ -56,10 +74,12 @@ pub struct SeekrIndex {
     /// Total number of indexed chunks.
     pub chunk_count: usize,
 
-    /// HNSW index for fast approximate nearest neighbor search.
-    /// Built in-memory from the vectors HashMap; not serialized to disk.
+    /// HNSW index loaded or built only when semantic search needs it.
     #[serde(skip)]
-    hnsw: Option<instant_distance::HnswMap<EmbeddingPoint, u64>>,
+    hnsw: OnceLock<instant_distance::HnswMap<EmbeddingPoint, u64>>,
+
+    #[serde(skip)]
+    index_dir: Option<PathBuf>,
 }
 
 impl std::fmt::Debug for SeekrIndex {
@@ -69,7 +89,7 @@ impl std::fmt::Debug for SeekrIndex {
             .field("embedding_dim", &self.embedding_dim)
             .field("chunk_count", &self.chunk_count)
             .field("vectors_len", &self.vectors.len())
-            .field("hnsw", &self.hnsw.as_ref().map(|_| "Some(<HnswMap>)"))
+            .field("hnsw", &self.hnsw.get().map(|_| "Some(<HnswMap>)"))
             .finish()
     }
 }
@@ -84,7 +104,8 @@ impl SeekrIndex {
             chunks: HashMap::new(),
             embedding_dim,
             chunk_count: 0,
-            hnsw: None,
+            hnsw: OnceLock::new(),
+            index_dir: None,
         }
     }
 
@@ -96,6 +117,7 @@ impl SeekrIndex {
 
     /// Add an entry while reporting the vanishingly rare hash collision.
     pub fn try_add_entry(&mut self, entry: IndexEntry, chunk: CodeChunk) -> Result<(), IndexError> {
+        self.hnsw.take();
         let chunk_id = entry.chunk_id;
 
         if let Some(existing) = self.chunks.get(&chunk_id) {
@@ -136,6 +158,7 @@ impl SeekrIndex {
     ///
     /// Removes the chunk from vectors, inverted index, and metadata.
     pub fn remove_chunk(&mut self, chunk_id: u64) {
+        self.hnsw.take();
         // Remove from vector index
         self.vectors.remove(&chunk_id);
 
@@ -195,21 +218,13 @@ impl SeekrIndex {
     ///
     /// Called after build_from(), load(), or after incremental updates.
     pub fn rebuild_hnsw(&mut self) {
+        self.hnsw.take();
         if self.vectors.is_empty() {
-            self.hnsw = None;
             return;
         }
 
-        let mut points = Vec::with_capacity(self.vectors.len());
-        let mut values = Vec::with_capacity(self.vectors.len());
-
-        for (&chunk_id, embedding) in &self.vectors {
-            points.push(EmbeddingPoint(embedding.clone()));
-            values.push(chunk_id);
-        }
-
-        let hnsw_map = instant_distance::Builder::default().build(points, values);
-        self.hnsw = Some(hnsw_map);
+        let hnsw_map = self.build_hnsw();
+        let _ = self.hnsw.set(hnsw_map);
 
         tracing::debug!(chunks = self.vectors.len(), "HNSW graph built");
     }
@@ -227,13 +242,52 @@ impl SeekrIndex {
         top_k: usize,
         score_threshold: f32,
     ) -> Vec<SearchHit> {
-        if let Some(ref hnsw) = self.hnsw {
+        if let Some(hnsw) = self.ensure_hnsw() {
             // Fast path: HNSW approximate nearest neighbor search
             self.search_vector_hnsw(hnsw, query_embedding, top_k, score_threshold)
         } else {
             // Fallback: brute-force KNN (for backward compatibility or small indexes)
             self.search_vector_brute_force(query_embedding, top_k, score_threshold)
         }
+    }
+
+    fn ensure_hnsw(&self) -> Option<&instant_distance::HnswMap<EmbeddingPoint, u64>> {
+        if self.vectors.is_empty() {
+            return None;
+        }
+        Some(self.hnsw.get_or_init(|| {
+            if let Some(index_dir) = &self.index_dir {
+                match self.load_hnsw_sidecar(index_dir) {
+                    Ok(Some(hnsw)) => {
+                        tracing::debug!("HNSW sidecar loaded");
+                        return hnsw;
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        tracing::warn!(%error, "Ignoring invalid HNSW sidecar");
+                    }
+                }
+            }
+
+            let hnsw = self.build_hnsw();
+            if let Some(index_dir) = &self.index_dir {
+                if let Err(error) = self.save_hnsw_sidecar(index_dir, &hnsw) {
+                    tracing::warn!(%error, "Failed to persist rebuilt HNSW sidecar");
+                }
+            }
+            hnsw
+        }))
+    }
+
+    fn build_hnsw(&self) -> instant_distance::HnswMap<EmbeddingPoint, u64> {
+        let mut entries: Vec<_> = self.vectors.iter().collect();
+        entries.sort_unstable_by_key(|(chunk_id, _)| **chunk_id);
+        let points = entries
+            .iter()
+            .map(|(_, embedding)| EmbeddingPoint((*embedding).clone()))
+            .collect();
+        let values = entries.iter().map(|(chunk_id, _)| **chunk_id).collect();
+        instant_distance::Builder::default().build(points, values)
     }
 
     /// HNSW-based vector search (O(log n) per query).
@@ -346,6 +400,9 @@ impl SeekrIndex {
         let data =
             bincode::serialize(self).map_err(|e| IndexError::Serialization(e.to_string()))?;
         crate::index::atomic::atomic_write(&index_path, &data)?;
+        if let Some(hnsw) = self.hnsw.get() {
+            self.save_hnsw_sidecar(dir, hnsw)?;
+        }
 
         // Remove old JSON index if present (migration from v1)
         let old_json_path = dir.join("index.json");
@@ -360,6 +417,56 @@ impl SeekrIndex {
         );
 
         Ok(())
+    }
+
+    fn save_hnsw_sidecar(
+        &self,
+        dir: &Path,
+        hnsw: &instant_distance::HnswMap<EmbeddingPoint, u64>,
+    ) -> Result<(), IndexError> {
+        let sidecar = HnswSidecarRef {
+            version: HNSW_SIDECAR_VERSION,
+            vector_fingerprint: self.vector_fingerprint(),
+            hnsw,
+        };
+        let data =
+            bincode::serialize(&sidecar).map_err(|e| IndexError::Serialization(e.to_string()))?;
+        crate::index::atomic::atomic_write(&dir.join(HNSW_FILENAME), &data)
+    }
+
+    fn load_hnsw_sidecar(
+        &self,
+        dir: &Path,
+    ) -> Result<Option<instant_distance::HnswMap<EmbeddingPoint, u64>>, IndexError> {
+        let path = dir.join(HNSW_FILENAME);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let data = std::fs::read(path)?;
+        let sidecar: HnswSidecar =
+            bincode::deserialize(&data).map_err(|e| IndexError::Serialization(e.to_string()))?;
+        if sidecar.version != HNSW_SIDECAR_VERSION
+            || sidecar.vector_fingerprint != self.vector_fingerprint()
+        {
+            return Ok(None);
+        }
+        Ok(Some(sidecar.hnsw))
+    }
+
+    fn vector_fingerprint(&self) -> [u8; 32] {
+        let mut entries: Vec<_> = self.vectors.iter().collect();
+        entries.sort_unstable_by_key(|(chunk_id, _)| **chunk_id);
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&(self.embedding_dim as u64).to_le_bytes());
+        hasher.update(&(entries.len() as u64).to_le_bytes());
+        for (chunk_id, embedding) in entries {
+            hasher.update(&chunk_id.to_le_bytes());
+            hasher.update(&(embedding.len() as u64).to_le_bytes());
+            for value in embedding {
+                hasher.update(&value.to_bits().to_le_bytes());
+            }
+        }
+        *hasher.finalize().as_bytes()
     }
 
     /// Load an index from a directory.
@@ -390,13 +497,12 @@ impl SeekrIndex {
             });
         }
 
-        // Rebuild HNSW graph from loaded vectors
-        index.rebuild_hnsw();
+        index.index_dir = Some(dir.to_path_buf());
 
         tracing::info!(
             chunks = index.chunk_count,
             path = %dir.display(),
-            "Index loaded (HNSW rebuilt)"
+            "Index loaded (HNSW deferred)"
         );
 
         Ok(index)
@@ -517,10 +623,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         index.save(dir.path()).unwrap();
         index.save(dir.path()).unwrap();
+        assert!(dir.path().join(HNSW_FILENAME).exists());
 
         let loaded = SeekrIndex::load(dir.path()).unwrap();
         assert_eq!(loaded.chunk_count, 1);
         assert_eq!(loaded.version, INDEX_VERSION);
+        assert!(loaded.hnsw.get().is_none());
+        assert!(!loaded.search_text("test", 10).is_empty());
+        assert!(
+            loaded.hnsw.get().is_none(),
+            "text search must not load HNSW"
+        );
+        assert!(!loaded.search_vector(&[0.5; 4], 1, 0.0).is_empty());
+        assert!(loaded.hnsw.get().is_some());
         assert!(std::fs::read_dir(dir.path()).unwrap().all(|entry| {
             !entry
                 .unwrap()
