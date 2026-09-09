@@ -4,6 +4,7 @@
 //! for keyword search. Supports mmap-based zero-copy loading and
 //! incremental updates.
 
+pub(crate) mod atomic;
 pub mod incremental;
 pub mod mmap_store;
 pub mod store;

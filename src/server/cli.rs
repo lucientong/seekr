@@ -10,7 +10,7 @@ use colored::Colorize;
 use indicatif::{ProgressBar, ProgressStyle};
 
 use crate::config::SeekrConfig;
-use crate::embedder::batch::{BatchEmbedder, DummyEmbedder};
+use crate::embedder::batch::BatchEmbedder;
 use crate::embedder::traits::Embedder;
 use crate::error::SeekrError;
 use crate::index::incremental::IncrementalState;
@@ -20,7 +20,7 @@ use crate::parser::chunker::chunk_file_from_path;
 use crate::parser::summary::generate_summary;
 use crate::scanner::filter::should_index_file;
 use crate::scanner::walker::walk_directory;
-use crate::search::ast_pattern::search_ast_pattern;
+use crate::search::ast_pattern::{looks_like_ast_pattern, search_ast_pattern};
 use crate::search::fusion::{
     fuse_ast_only, fuse_semantic_only, fuse_text_only, rrf_fuse, rrf_fuse_three,
 };
@@ -219,47 +219,32 @@ pub fn cmd_index(
     let embeddings = if new_chunks.is_empty() {
         Vec::new()
     } else {
-        match create_embedder(config) {
-            Ok(embedder) => {
-                let batch = BatchEmbedder::new(embedder, config.embedding.batch_size);
-                let pb_embed = if !json_output {
-                    let pb = ProgressBar::new(summaries.len() as u64);
-                    pb.set_style(
-                        ProgressStyle::with_template(
-                            "  {bar:40.green/blue} {pos}/{len} embeddings",
-                        )
+        {
+            let embedder = create_embedder(config)?;
+            let batch = BatchEmbedder::new(embedder, config.embedding.batch_size);
+            let pb_embed = if !json_output {
+                let pb = ProgressBar::new(summaries.len() as u64);
+                pb.set_style(
+                    ProgressStyle::with_template("  {bar:40.green/blue} {pos}/{len} embeddings")
                         .unwrap()
                         .progress_chars("██░"),
-                    );
-                    Some(pb)
-                } else {
-                    None
-                };
+                );
+                Some(pb)
+            } else {
+                None
+            };
 
-                let result = batch.embed_all_with_progress(&summaries, |completed, _total| {
-                    if let Some(ref pb) = pb_embed {
-                        pb.set_position(completed as u64);
-                    }
-                })?;
-
-                if let Some(pb) = pb_embed {
-                    pb.finish_and_clear();
+            let result = batch.embed_all_with_progress(&summaries, |completed, _total| {
+                if let Some(ref pb) = pb_embed {
+                    pb.set_position(completed as u64);
                 }
+            })?;
 
-                result
+            if let Some(pb) = pb_embed {
+                pb.finish_and_clear();
             }
-            Err(e) => {
-                tracing::warn!("ONNX embedder unavailable ({}), using dummy embedder", e);
-                if !json_output {
-                    eprintln!(
-                        "  {} ONNX model unavailable, using placeholder embeddings",
-                        "⚠".yellow()
-                    );
-                }
-                let dummy = DummyEmbedder::new(384);
-                let batch = BatchEmbedder::new(dummy, config.embedding.batch_size);
-                batch.embed_all(&summaries)?
-            }
+
+            result
         }
     };
 
@@ -292,11 +277,11 @@ pub fn cmd_index(
                 embedding: embedding.clone(),
                 text_tokens,
             };
-            idx.add_entry(entry, chunk.clone());
+            idx.try_add_entry(entry, chunk.clone())?;
         }
         idx
     } else {
-        SeekrIndex::build_from(&new_chunks, &embeddings, embedding_dim)
+        SeekrIndex::try_build_from(&new_chunks, &embeddings, embedding_dim)?
     };
 
     // Save index
@@ -414,8 +399,11 @@ pub fn cmd_search(
             let semantic_results =
                 search_semantic(&index, query, embedder.as_ref(), &semantic_options)?;
 
-            // Try AST pattern search — it's fine if the query doesn't parse as an AST pattern
-            let ast_results = search_ast_pattern(&index, query, top_k).unwrap_or_default();
+            let ast_results = if looks_like_ast_pattern(query) {
+                search_ast_pattern(&index, query, top_k).unwrap_or_default()
+            } else {
+                Vec::new()
+            };
 
             if ast_results.is_empty() {
                 // 2-way fusion when no AST matches
@@ -620,7 +608,7 @@ fn print_results_colored(results: &[SearchResult], elapsed: &std::time::Duration
     }
 }
 
-/// Create an embedder for indexing (OnnxEmbedder or fall back to DummyEmbedder).
+/// Create the production ONNX embedder.
 fn create_embedder(config: &SeekrConfig) -> Result<Box<dyn Embedder>, SeekrError> {
     match crate::embedder::onnx::OnnxEmbedder::new(&config.model_dir) {
         Ok(embedder) => Ok(Box::new(embedder)),
@@ -634,13 +622,9 @@ fn create_embedder(config: &SeekrConfig) -> Result<Box<dyn Embedder>, SeekrError
 }
 
 /// Create an embedder for search queries.
-/// Falls back to DummyEmbedder if OnnxEmbedder is unavailable.
 fn create_embedder_for_search(config: &SeekrConfig) -> Result<Box<dyn Embedder>, SeekrError> {
     match crate::embedder::onnx::OnnxEmbedder::new(&config.model_dir) {
         Ok(embedder) => Ok(Box::new(embedder)),
-        Err(_e) => {
-            tracing::warn!("ONNX embedder unavailable for search, using dummy embedder");
-            Ok(Box::new(DummyEmbedder::new(384)))
-        }
+        Err(e) => Err(SeekrError::Embedder(e)),
     }
 }

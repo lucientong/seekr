@@ -6,8 +6,9 @@
 use std::path::{Path, PathBuf};
 
 use seekr_code::config::SeekrConfig;
-use seekr_code::embedder::batch::{BatchEmbedder, DummyEmbedder};
+use seekr_code::embedder::batch::BatchEmbedder;
 use seekr_code::embedder::traits::Embedder;
+use seekr_code::error::EmbedderError;
 use seekr_code::index::IndexEntry;
 use seekr_code::index::incremental::IncrementalState;
 use seekr_code::index::store::SeekrIndex;
@@ -20,6 +21,38 @@ use seekr_code::search::ast_pattern::{parse_pattern, search_ast_pattern};
 use seekr_code::search::fusion::rrf_fuse;
 use seekr_code::search::semantic::{SemanticSearchOptions, search_semantic};
 use seekr_code::search::text::{TextSearchOptions, search_text_regex};
+
+struct DummyEmbedder {
+    dim: usize,
+}
+
+impl DummyEmbedder {
+    fn new(dim: usize) -> Self {
+        Self { dim }
+    }
+}
+
+impl Embedder for DummyEmbedder {
+    fn embed(&self, text: &str) -> Result<Vec<f32>, EmbedderError> {
+        let mut embedding = vec![0.0; self.dim];
+        for (index, byte) in text.bytes().enumerate() {
+            embedding[index % self.dim] += byte as f32;
+        }
+        let norm = embedding
+            .iter()
+            .map(|value| value * value)
+            .sum::<f32>()
+            .sqrt();
+        if norm > 0.0 {
+            embedding.iter_mut().for_each(|value| *value /= norm);
+        }
+        Ok(embedding)
+    }
+
+    fn dimension(&self) -> usize {
+        self.dim
+    }
+}
 
 fn fixtures_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))

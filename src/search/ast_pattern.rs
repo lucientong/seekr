@@ -171,6 +171,15 @@ pub fn search_ast_pattern(
     Ok(matches)
 }
 
+/// Return whether a hybrid query has explicit structural syntax.
+pub fn looks_like_ast_pattern(query: &str) -> bool {
+    query.contains("->")
+        || query.contains('(')
+        || query
+            .split(|ch: char| !ch.is_alphanumeric() && ch != '_')
+            .any(|token| matches!(token, "fn" | "class" | "struct" | "enum" | "trait"))
+}
+
 /// Match a single chunk against a parsed AST pattern.
 /// Returns a score from 0.0 (no match) to 1.0 (perfect match).
 fn match_chunk(pattern: &AstPattern, chunk: &CodeChunk) -> f32 {
@@ -725,6 +734,14 @@ fn fuzzy_type_match(pattern: &str, actual: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn test_ast_pattern_intent_detection() {
+        assert!(looks_like_ast_pattern("fn authenticate(string) -> Result"));
+        assert!(looks_like_ast_pattern("struct Config"));
+        assert!(!looks_like_ast_pattern("find authentication logic"));
+        assert!(!looks_like_ast_pattern("classify user requests"));
+    }
+
     use super::*;
     use crate::parser::ChunkKind;
     use std::path::PathBuf;

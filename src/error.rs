@@ -102,6 +102,15 @@ pub enum IndexError {
     #[error("Corrupted index: {0}")]
     Corrupted(String),
 
+    #[error(
+        "Chunk ID collision for {chunk_id}: existing '{existing_path}', incoming '{incoming_path}'"
+    )]
+    ChunkIdCollision {
+        chunk_id: u64,
+        existing_path: PathBuf,
+        incoming_path: PathBuf,
+    },
+
     #[error("Serialization error: {0}")]
     Serialization(String),
 

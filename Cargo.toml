@@ -1,6 +1,6 @@
 [package]
 name = "seekr-code"
-version = "1.0.1"
+version = "1.0.2"
 edition = "2024"
 rust-version = "1.85.0"
 authors = ["lucientong"]
@@ -95,6 +95,7 @@ instant-distance = "0.6"
 
 # Hashing
 blake3 = "1.6"
+sha2 = "0.10"
 
 # CLI progress bar
 indicatif = "0.17"

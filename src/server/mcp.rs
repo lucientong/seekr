@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::config::SeekrConfig;
-use crate::embedder::batch::{BatchEmbedder, DummyEmbedder};
+use crate::embedder::batch::BatchEmbedder;
 use crate::embedder::traits::Embedder;
 use crate::index::store::SeekrIndex;
 use crate::parser::CodeChunk;
@@ -24,7 +24,7 @@ use crate::parser::chunker::chunk_file_from_path;
 use crate::parser::summary::generate_summary;
 use crate::scanner::filter::should_index_file;
 use crate::scanner::walker::walk_directory;
-use crate::search::ast_pattern::search_ast_pattern;
+use crate::search::ast_pattern::{looks_like_ast_pattern, search_ast_pattern};
 use crate::search::fusion::{
     fuse_ast_only, fuse_semantic_only, fuse_text_only, rrf_fuse, rrf_fuse_three,
 };
@@ -144,6 +144,9 @@ pub fn run_mcp_stdio(config: &SeekrConfig) -> Result<(), crate::error::ServerErr
         };
 
         if request.jsonrpc != "2.0" {
+            if request.id.is_none() {
+                continue;
+            }
             let resp = JsonRpcResponse::error(
                 request.id,
                 ERROR_INVALID_REQUEST,
@@ -153,8 +156,9 @@ pub fn run_mcp_stdio(config: &SeekrConfig) -> Result<(), crate::error::ServerErr
             continue;
         }
 
-        let response = handle_request(&request, config);
-        write_response(&mut stdout, &response);
+        if let Some(response) = handle_request(&request, config) {
+            write_response(&mut stdout, &response);
+        }
     }
 
     tracing::info!("MCP Server shutting down");
@@ -170,15 +174,20 @@ fn write_response(writer: &mut impl Write, response: &JsonRpcResponse) {
 }
 
 /// Route an incoming MCP request to the appropriate handler.
-fn handle_request(request: &JsonRpcRequest, config: &SeekrConfig) -> JsonRpcResponse {
-    match request.method.as_str() {
+fn handle_request(request: &JsonRpcRequest, config: &SeekrConfig) -> Option<JsonRpcResponse> {
+    if request.id.is_none() {
+        match request.method.as_str() {
+            "notifications/initialized" | "initialized" => {
+                tracing::debug!("MCP client initialized");
+            }
+            _ => tracing::debug!(method = %request.method, "Ignoring JSON-RPC notification"),
+        }
+        return None;
+    }
+
+    Some(match request.method.as_str() {
         // MCP lifecycle
         "initialize" => handle_initialize(request),
-        "initialized" => {
-            // Notification — no response needed, but we return a result anyway
-            // since some clients expect it
-            JsonRpcResponse::success(request.id.clone(), Value::Null)
-        }
         "ping" => JsonRpcResponse::success(request.id.clone(), serde_json::json!({})),
 
         // MCP discovery
@@ -193,7 +202,7 @@ fn handle_request(request: &JsonRpcRequest, config: &SeekrConfig) -> JsonRpcResp
             ERROR_METHOD_NOT_FOUND,
             format!("Method not found: {}", request.method),
         ),
-    }
+    })
 }
 
 // ============================================================
@@ -495,7 +504,16 @@ fn handle_tool_index(
         .unwrap_or(384);
 
     // Build and save
-    let index = SeekrIndex::build_from(&all_chunks, &embeddings, embedding_dim);
+    let index = match SeekrIndex::try_build_from(&all_chunks, &embeddings, embedding_dim) {
+        Ok(index) => index,
+        Err(e) => {
+            return JsonRpcResponse::error(
+                id,
+                ERROR_INTERNAL,
+                format!("Index build failed: {}", e),
+            );
+        }
+    };
     let index_dir = config.project_index_dir(&project_path);
 
     if let Err(e) = index.save(&index_dir) {
@@ -643,8 +661,11 @@ fn execute_search(
                 search_semantic(index, query, embedder.as_ref(), &semantic_options)
                     .map_err(|e| e.to_string())?;
 
-            // Try AST pattern search — silently degrade if query isn't a valid AST pattern
-            let ast_results = search_ast_pattern(index, query, top_k).unwrap_or_default();
+            let ast_results = if looks_like_ast_pattern(query) {
+                search_ast_pattern(index, query, top_k).unwrap_or_default()
+            } else {
+                Vec::new()
+            };
 
             if ast_results.is_empty() {
                 // 2-way fusion when no AST matches
@@ -672,15 +693,11 @@ fn execute_search(
     }
 }
 
-/// Create an embedder. Falls back to DummyEmbedder if ONNX is unavailable.
+/// Create the production ONNX embedder.
 fn create_embedder(config: &SeekrConfig) -> Result<Box<dyn Embedder>, String> {
-    match crate::embedder::onnx::OnnxEmbedder::new(&config.model_dir) {
-        Ok(embedder) => Ok(Box::new(embedder)),
-        Err(_) => {
-            tracing::warn!("ONNX embedder unavailable, using dummy embedder");
-            Ok(Box::new(DummyEmbedder::new(384)))
-        }
-    }
+    crate::embedder::onnx::OnnxEmbedder::new(&config.model_dir)
+        .map(|embedder| Box::new(embedder) as Box<dyn Embedder>)
+        .map_err(|e| e.to_string())
 }
 
 /// Format search results into a readable text block for MCP tool output.
@@ -725,4 +742,27 @@ fn format_results_for_mcp(results: &[SearchResult], duration_ms: u64) -> String 
     }
 
     output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn notifications_do_not_produce_responses() {
+        let config = SeekrConfig::default();
+        for method in [
+            "notifications/initialized",
+            "initialized",
+            "unknown/notification",
+        ] {
+            let request = JsonRpcRequest {
+                jsonrpc: "2.0".to_string(),
+                id: None,
+                method: method.to_string(),
+                params: None,
+            };
+            assert!(handle_request(&request, &config).is_none());
+        }
+    }
 }

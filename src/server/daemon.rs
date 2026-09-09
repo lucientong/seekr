@@ -233,7 +233,11 @@ async fn process_single_file(
     }
 
     // Generate embeddings
-    let texts: Vec<&str> = chunks.iter().map(|c| c.body.as_str()).collect();
+    let summaries: Vec<String> = chunks
+        .iter()
+        .map(crate::parser::summary::generate_summary)
+        .collect();
+    let texts: Vec<&str> = summaries.iter().map(String::as_str).collect();
     let embeddings = embedder.embed_batch(&texts).map_err(|e| e.to_string())?;
 
     // Add to index
@@ -247,7 +251,8 @@ async fn process_single_file(
                 embedding: embedding.clone(),
                 text_tokens,
             };
-            idx.add_entry(entry, chunk.clone());
+            idx.try_add_entry(entry, chunk.clone())
+                .map_err(|e| e.to_string())?;
             chunk_ids.push(chunk.id);
         }
     }

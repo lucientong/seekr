@@ -64,10 +64,12 @@ impl<E: Embedder> BatchEmbedder<E> {
 }
 
 /// A dummy embedder for testing that produces random-like but deterministic vectors.
+#[cfg(test)]
 pub struct DummyEmbedder {
     dim: usize,
 }
 
+#[cfg(test)]
 impl DummyEmbedder {
     /// Create a new dummy embedder with the given dimension.
     pub fn new(dim: usize) -> Self {
@@ -75,6 +77,7 @@ impl DummyEmbedder {
     }
 }
 
+#[cfg(test)]
 impl Embedder for DummyEmbedder {
     fn embed(&self, text: &str) -> Result<Vec<f32>, EmbedderError> {
         // Generate a deterministic pseudo-random embedding based on text content

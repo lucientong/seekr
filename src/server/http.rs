@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 
 use crate::config::SeekrConfig;
-use crate::embedder::batch::{BatchEmbedder, DummyEmbedder};
+use crate::embedder::batch::BatchEmbedder;
 use crate::embedder::traits::Embedder;
 use crate::index::store::SeekrIndex;
 use crate::parser::CodeChunk;
@@ -25,7 +25,7 @@ use crate::parser::chunker::chunk_file_from_path;
 use crate::parser::summary::generate_summary;
 use crate::scanner::filter::should_index_file;
 use crate::scanner::walker::walk_directory;
-use crate::search::ast_pattern::search_ast_pattern;
+use crate::search::ast_pattern::{looks_like_ast_pattern, search_ast_pattern};
 use crate::search::fusion::{
     fuse_ast_only, fuse_semantic_only, fuse_text_only, rrf_fuse, rrf_fuse_three,
 };
@@ -307,8 +307,11 @@ async fn handle_search(
                     },
                 )?;
 
-            // Try AST pattern search — silently degrade if query isn't a valid AST pattern
-            let ast_results = search_ast_pattern(&index, &req.query, top_k).unwrap_or_default();
+            let ast_results = if looks_like_ast_pattern(&req.query) {
+                search_ast_pattern(&index, &req.query, top_k).unwrap_or_default()
+            } else {
+                Vec::new()
+            };
 
             if ast_results.is_empty() {
                 // 2-way fusion when no AST matches
@@ -431,33 +434,25 @@ async fn handle_index(
     let summaries: Vec<String> = all_chunks.iter().map(generate_summary).collect();
 
     // Step 4: Generate embeddings
-    let embeddings = match create_embedder(config) {
-        Ok(embedder) => {
-            let batch = BatchEmbedder::new(embedder, config.embedding.batch_size);
-            batch.embed_all(&summaries).map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ErrorResponse {
-                        error: "Embedding failed".to_string(),
-                        details: Some(e.to_string()),
-                    }),
-                )
-            })?
-        }
-        Err(_) => {
-            let dummy = DummyEmbedder::new(384);
-            let batch = BatchEmbedder::new(dummy, config.embedding.batch_size);
-            batch.embed_all(&summaries).map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ErrorResponse {
-                        error: "Embedding failed".to_string(),
-                        details: Some(e.to_string()),
-                    }),
-                )
-            })?
-        }
-    };
+    let embedder = create_embedder(config).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: "Embedder unavailable".to_string(),
+                details: Some(e),
+            }),
+        )
+    })?;
+    let batch = BatchEmbedder::new(embedder, config.embedding.batch_size);
+    let embeddings = batch.embed_all(&summaries).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: "Embedding failed".to_string(),
+                details: Some(e.to_string()),
+            }),
+        )
+    })?;
 
     let embedding_dim = embeddings
         .first()
@@ -465,7 +460,16 @@ async fn handle_index(
         .unwrap_or(384);
 
     // Step 5: Build and save index
-    let index = SeekrIndex::build_from(&all_chunks, &embeddings, embedding_dim);
+    let index =
+        SeekrIndex::try_build_from(&all_chunks, &embeddings, embedding_dim).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: "Index build failed".to_string(),
+                    details: Some(e.to_string()),
+                }),
+            )
+        })?;
     let index_dir = config.project_index_dir(&project_path);
     index.save(&index_dir).map_err(|e| {
         (
@@ -542,13 +546,9 @@ async fn handle_status(
     }
 }
 
-/// Create an embedder instance. Falls back to DummyEmbedder if ONNX is unavailable.
+/// Create the production ONNX embedder.
 fn create_embedder(config: &SeekrConfig) -> Result<Box<dyn Embedder>, String> {
-    match crate::embedder::onnx::OnnxEmbedder::new(&config.model_dir) {
-        Ok(embedder) => Ok(Box::new(embedder)),
-        Err(e) => {
-            tracing::warn!("ONNX embedder unavailable: {}, using dummy embedder", e);
-            Ok(Box::new(DummyEmbedder::new(384)))
-        }
-    }
+    crate::embedder::onnx::OnnxEmbedder::new(&config.model_dir)
+        .map(|embedder| Box::new(embedder) as Box<dyn Embedder>)
+        .map_err(|e| e.to_string())
 }

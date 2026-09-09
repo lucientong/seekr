@@ -23,7 +23,8 @@ pub mod server;
 /// Current index format version.
 /// Increment this when the on-disk index format changes.
 /// v2: switched serialization from JSON to bincode for faster save/load.
-pub const INDEX_VERSION: u32 = 2;
+/// v3: content-addressed chunk IDs; v2 indexes must be rebuilt.
+pub const INDEX_VERSION: u32 = 3;
 
 /// Seekr version string (from Cargo.toml).
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

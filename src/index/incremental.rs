@@ -65,8 +65,7 @@ impl IncrementalState {
 
         let data = serde_json::to_vec_pretty(self)
             .map_err(|e| IndexError::Serialization(e.to_string()))?;
-        std::fs::write(path, data)?;
-        Ok(())
+        crate::index::atomic::atomic_write(path, &data)
     }
 
     /// Detect changes between the current file system state and the last index.

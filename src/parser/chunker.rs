@@ -4,7 +4,6 @@
 //! methods, structs, etc.) from parsed source files.
 
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use tree_sitter::Node;
 
@@ -12,12 +11,29 @@ use crate::error::ParserError;
 use crate::parser::treesitter::SupportedLanguage;
 use crate::parser::{ChunkKind, CodeChunk, ParseResult};
 
-/// Global chunk ID counter (monotonically increasing).
-static CHUNK_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
-
-/// Generate a new unique chunk ID.
-fn next_chunk_id() -> u64 {
-    CHUNK_ID_COUNTER.fetch_add(1, Ordering::Relaxed)
+/// Generate a stable content-addressed chunk ID.
+///
+/// Length-prefixed fields prevent ambiguous concatenations while including the
+/// path keeps identical declarations in different files distinct.
+fn stable_chunk_id(path: &Path, kind: &ChunkKind, name: Option<&str>, body: &str) -> u64 {
+    let mut hasher = blake3::Hasher::new();
+    let path = path.to_string_lossy();
+    let kind = kind.to_string();
+    for field in [
+        path.as_bytes(),
+        kind.as_bytes(),
+        name.unwrap_or("").as_bytes(),
+        body.as_bytes(),
+    ] {
+        hasher.update(&(field.len() as u64).to_le_bytes());
+        hasher.update(field);
+    }
+    let digest = hasher.finalize();
+    u64::from_le_bytes(
+        digest.as_bytes()[..8]
+            .try_into()
+            .expect("fixed digest size"),
+    )
 }
 
 /// Minimum number of lines for a chunk to be considered meaningful.
@@ -43,12 +59,14 @@ pub fn chunk_file(
         // For non-code languages (JSON, TOML, etc.), create a single chunk
         // for the entire file if it's not too large
         if source.lines().count() <= FALLBACK_CHUNK_SIZE * 2 {
+            let kind = ChunkKind::Block;
+            let name = path.file_name().and_then(|f| f.to_str()).map(String::from);
             chunks.push(CodeChunk {
-                id: next_chunk_id(),
+                id: stable_chunk_id(path, &kind, name.as_deref(), source),
                 file_path: path.to_path_buf(),
                 language: lang.name().to_string(),
-                kind: ChunkKind::Block,
-                name: path.file_name().and_then(|f| f.to_str()).map(String::from),
+                kind,
+                name,
                 signature: None,
                 doc_comment: None,
                 body: source.to_string(),
@@ -162,7 +180,7 @@ fn node_to_chunk(
     let doc_comment = extract_doc_comment(node, source, start_line);
 
     Some(CodeChunk {
-        id: next_chunk_id(),
+        id: stable_chunk_id(file_path, &kind, name.as_deref(), &body),
         file_path: file_path.to_path_buf(),
         language: lang.name().to_string(),
         kind,
@@ -334,17 +352,19 @@ fn fallback_line_chunks(file_path: &Path, source: &str, lang: SupportedLanguage)
         let byte_end = offset + body.len();
         offset = byte_end + 1; // +1 for the newline between chunks
 
+        let kind = ChunkKind::Block;
+        let name = Some(format!(
+            "{}:L{}-L{}",
+            file_path.file_name().unwrap_or_default().to_string_lossy(),
+            chunk_start + 1,
+            chunk_end
+        ));
         chunks.push(CodeChunk {
-            id: next_chunk_id(),
+            id: stable_chunk_id(file_path, &kind, name.as_deref(), &body),
             file_path: file_path.to_path_buf(),
             language: lang.name().to_string(),
-            kind: ChunkKind::Block,
-            name: Some(format!(
-                "{}:L{}-L{}",
-                file_path.file_name().unwrap_or_default().to_string_lossy(),
-                chunk_start + 1,
-                chunk_end
-            )),
+            kind,
+            name,
             signature: None,
             doc_comment: None,
             body,
@@ -477,5 +497,16 @@ class EventEmitter {
 
         // Bash has empty chunk_node_kinds, so should get a single block chunk
         assert!(!result.chunks.is_empty());
+    }
+
+    #[test]
+    fn test_chunk_ids_are_stable_and_path_scoped() {
+        let source = "fn stable() {\n    println!(\"same\");\n}\n";
+        let first = chunk_file(Path::new("a.rs"), source, SupportedLanguage::Rust).unwrap();
+        let second = chunk_file(Path::new("a.rs"), source, SupportedLanguage::Rust).unwrap();
+        let other_path = chunk_file(Path::new("b.rs"), source, SupportedLanguage::Rust).unwrap();
+
+        assert_eq!(first.chunks[0].id, second.chunks[0].id);
+        assert_ne!(first.chunks[0].id, other_path.chunks[0].id);
     }
 }

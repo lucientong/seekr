@@ -90,7 +90,28 @@ impl SeekrIndex {
 
     /// Add an entry to the index.
     pub fn add_entry(&mut self, entry: IndexEntry, chunk: CodeChunk) {
+        self.try_add_entry(entry, chunk)
+            .expect("content-addressed chunk ID collision");
+    }
+
+    /// Add an entry while reporting the vanishingly rare hash collision.
+    pub fn try_add_entry(&mut self, entry: IndexEntry, chunk: CodeChunk) -> Result<(), IndexError> {
         let chunk_id = entry.chunk_id;
+
+        if let Some(existing) = self.chunks.get(&chunk_id) {
+            let same_identity = existing.file_path == chunk.file_path
+                && existing.kind == chunk.kind
+                && existing.name == chunk.name
+                && existing.body == chunk.body;
+            if !same_identity {
+                return Err(IndexError::ChunkIdCollision {
+                    chunk_id,
+                    existing_path: existing.file_path.clone(),
+                    incoming_path: chunk.file_path.clone(),
+                });
+            }
+            self.remove_chunk(chunk_id);
+        }
 
         // Add to vector index
         self.vectors.insert(chunk_id, entry.embedding);
@@ -108,6 +129,7 @@ impl SeekrIndex {
         // Store chunk metadata
         self.chunks.insert(chunk_id, chunk);
         self.chunk_count = self.chunks.len();
+        Ok(())
     }
 
     /// Remove a chunk from the index by ID.
@@ -139,6 +161,16 @@ impl SeekrIndex {
     ///
     /// Also builds the HNSW graph for fast approximate nearest neighbor search.
     pub fn build_from(chunks: &[CodeChunk], embeddings: &[Vec<f32>], embedding_dim: usize) -> Self {
+        Self::try_build_from(chunks, embeddings, embedding_dim)
+            .expect("content-addressed chunk ID collision")
+    }
+
+    /// Build an index and return a structured error if chunk IDs collide.
+    pub fn try_build_from(
+        chunks: &[CodeChunk],
+        embeddings: &[Vec<f32>],
+        embedding_dim: usize,
+    ) -> Result<Self, IndexError> {
         let mut index = Self::new(embedding_dim);
 
         for (chunk, embedding) in chunks.iter().zip(embeddings.iter()) {
@@ -150,13 +182,13 @@ impl SeekrIndex {
                 text_tokens,
             };
 
-            index.add_entry(entry, chunk.clone());
+            index.try_add_entry(entry, chunk.clone())?;
         }
 
         // Build HNSW graph from all vectors
         index.rebuild_hnsw();
 
-        index
+        Ok(index)
     }
 
     /// Rebuild the HNSW graph from the current vectors HashMap.
@@ -306,14 +338,14 @@ impl SeekrIndex {
 
     /// Save the index to a directory.
     ///
-    /// Uses bincode for fast binary serialization (v2 format).
+    /// Uses bincode serialization and an atomic replace (v3 format).
     pub fn save(&self, dir: &Path) -> Result<(), IndexError> {
         std::fs::create_dir_all(dir)?;
 
         let index_path = dir.join("index.bin");
         let data =
             bincode::serialize(self).map_err(|e| IndexError::Serialization(e.to_string()))?;
-        std::fs::write(&index_path, data)?;
+        crate::index::atomic::atomic_write(&index_path, &data)?;
 
         // Remove old JSON index if present (migration from v1)
         let old_json_path = dir.join("index.json");
@@ -324,7 +356,7 @@ impl SeekrIndex {
         tracing::info!(
             chunks = self.chunk_count,
             path = %dir.display(),
-            "Index saved (bincode v2)"
+            "Index saved (bincode v3)"
         );
 
         Ok(())
@@ -332,14 +364,14 @@ impl SeekrIndex {
 
     /// Load an index from a directory.
     ///
-    /// Tries bincode format (v2) first, then falls back to JSON (v1) for migration.
+    /// Tries bincode format first, then falls back to JSON (v1) for migration.
     /// After loading, rebuilds the HNSW graph from the vectors for fast search.
     pub fn load(dir: &Path) -> Result<Self, IndexError> {
         let bin_path = dir.join("index.bin");
         let json_path = dir.join("index.json");
 
         let mut index: SeekrIndex = if bin_path.exists() {
-            // v2: bincode format
+            // v2/v3: bincode format
             let data = std::fs::read(&bin_path)?;
             bincode::deserialize(&data).map_err(|e| IndexError::Serialization(e.to_string()))?
         } else if json_path.exists() {
@@ -484,10 +516,18 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         index.save(dir.path()).unwrap();
+        index.save(dir.path()).unwrap();
 
         let loaded = SeekrIndex::load(dir.path()).unwrap();
         assert_eq!(loaded.chunk_count, 1);
         assert_eq!(loaded.version, INDEX_VERSION);
+        assert!(std::fs::read_dir(dir.path()).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(".tmp-")
+        }));
     }
 
     #[test]
@@ -498,5 +538,34 @@ mod tests {
         assert!(tokens.contains(&"username".to_string()));
         assert!(tokens.contains(&"result".to_string()));
         assert!(tokens.contains(&"string".to_string()));
+    }
+
+    #[test]
+    fn test_add_entry_rejects_chunk_id_collision_without_overwrite() {
+        let mut index = SeekrIndex::new(2);
+        let first = make_test_chunk(7, "first", "fn first() {}");
+        index.add_entry(
+            IndexEntry {
+                chunk_id: 7,
+                embedding: vec![1.0, 0.0],
+                text_tokens: vec!["first".to_string()],
+            },
+            first.clone(),
+        );
+
+        let mut collision = make_test_chunk(7, "second", "fn second() {}");
+        collision.file_path = PathBuf::from("other.rs");
+        let result = index.try_add_entry(
+            IndexEntry {
+                chunk_id: 7,
+                embedding: vec![0.0, 1.0],
+                text_tokens: vec!["second".to_string()],
+            },
+            collision,
+        );
+
+        assert!(matches!(result, Err(IndexError::ChunkIdCollision { .. })));
+        assert_eq!(index.get_chunk(7).unwrap().name.as_deref(), Some("first"));
+        assert_eq!(index.vectors[&7], vec![1.0, 0.0]);
     }
 }

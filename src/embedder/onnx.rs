@@ -9,22 +9,47 @@ use std::sync::Mutex;
 use ort::session::Session;
 use ort::session::builder::GraphOptimizationLevel;
 use ort::value::TensorRef;
+use sha2::{Digest, Sha256};
 
 use crate::embedder::traits::Embedder;
 use crate::error::EmbedderError;
 
-/// HuggingFace model URL for all-MiniLM-L6-v2 ONNX.
-const MODEL_URL: &str = "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/onnx/model_quantized.onnx";
+/// Pinned HuggingFace revision. Checksums below are for this immutable snapshot.
+const MODEL_REVISION: &str = "1110a243fdf4706b3f48f1d95db1a4f5529b4d41";
+const MODEL_BASE_URL: &str =
+    "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve";
 
-/// Expected model filename.
-const MODEL_FILENAME: &str = "all-MiniLM-L6-v2-quantized.onnx";
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ModelArtifact {
+    filename: &'static str,
+    sha256: &'static str,
+}
+
+const MODEL_ARTIFACTS: [ModelArtifact; 4] = [
+    ModelArtifact {
+        filename: "model_qint8_arm64.onnx",
+        sha256: "4278337fd0ff3c68bfb6291042cad8ab363e1d9fbc43dcb499fe91c871902474",
+    },
+    ModelArtifact {
+        filename: "model_qint8_avx512.onnx",
+        sha256: "4278337fd0ff3c68bfb6291042cad8ab363e1d9fbc43dcb499fe91c871902474",
+    },
+    ModelArtifact {
+        filename: "model_quint8_avx2.onnx",
+        sha256: "b941bf19f1f1283680f449fa6a7336bb5600bdcd5f84d10ddc5cd72218a0fd21",
+    },
+    ModelArtifact {
+        filename: "model.onnx",
+        sha256: "6fd5d72fe4589f189f8ebc006442dbb529bb7ce38f8082112682524616046452",
+    },
+];
 
 /// Tokenizer URL.
-const TOKENIZER_URL: &str =
-    "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/tokenizer.json";
+const TOKENIZER_URL: &str = "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/1110a243fdf4706b3f48f1d95db1a4f5529b4d41/tokenizer.json";
 
 /// Tokenizer filename.
 const TOKENIZER_FILENAME: &str = "tokenizer.json";
+const TOKENIZER_SHA256: &str = "be50c3628f2bf5bb5e3a7f17b1f74611b2561a3a27eeab05e5aa30f411572037";
 
 /// Embedding dimension for all-MiniLM-L6-v2.
 const EMBEDDING_DIM: usize = 384;
@@ -49,22 +74,16 @@ impl OnnxEmbedder {
     pub fn new(model_dir: &Path) -> Result<Self, EmbedderError> {
         std::fs::create_dir_all(model_dir).map_err(EmbedderError::Io)?;
 
-        let model_path = model_dir.join(MODEL_FILENAME);
+        let artifact = select_model_artifact();
+        let model_path = model_dir.join(artifact.filename);
+        let model_url = format!(
+            "{}/{}/onnx/{}",
+            MODEL_BASE_URL, MODEL_REVISION, artifact.filename
+        );
+        ensure_file(&model_url, &model_path, artifact.sha256)?;
 
-        // Download model if not present
-        if !model_path.exists() {
-            tracing::info!("Downloading ONNX model to {}...", model_path.display());
-            download_file(MODEL_URL, &model_path)?;
-            tracing::info!("Model downloaded successfully.");
-        }
-
-        // Download tokenizer if not present
         let tokenizer_path = model_dir.join(TOKENIZER_FILENAME);
-        if !tokenizer_path.exists() {
-            tracing::info!("Downloading tokenizer...");
-            download_file(TOKENIZER_URL, &tokenizer_path)?;
-            tracing::info!("Tokenizer downloaded successfully.");
-        }
+        ensure_file(TOKENIZER_URL, &tokenizer_path, TOKENIZER_SHA256)?;
 
         // Create ONNX Runtime session
         let session = Session::builder()
@@ -236,8 +255,43 @@ impl Embedder for OnnxEmbedder {
     }
 }
 
-/// Download a file from a URL to a local path.
-fn download_file(url: &str, dest: &Path) -> Result<(), EmbedderError> {
+fn select_model_artifact() -> ModelArtifact {
+    #[cfg(target_arch = "aarch64")]
+    {
+        MODEL_ARTIFACTS[0]
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::is_x86_feature_detected!("avx512f") {
+            MODEL_ARTIFACTS[1]
+        } else if std::is_x86_feature_detected!("avx2") {
+            MODEL_ARTIFACTS[2]
+        } else {
+            MODEL_ARTIFACTS[3]
+        }
+    }
+
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        MODEL_ARTIFACTS[3]
+    }
+}
+
+fn ensure_file(url: &str, dest: &Path, expected_sha256: &str) -> Result<(), EmbedderError> {
+    if dest.exists() {
+        verify_checksum(dest, expected_sha256)?;
+        return Ok(());
+    }
+
+    tracing::info!("Downloading model asset to {}...", dest.display());
+    download_file(url, dest, expected_sha256)?;
+    tracing::info!("Model asset downloaded and verified.");
+    Ok(())
+}
+
+/// Download a file, verify its SHA256, then atomically move it into place.
+fn download_file(url: &str, dest: &Path, expected_sha256: &str) -> Result<(), EmbedderError> {
     let response = reqwest::blocking::get(url)
         .map_err(|e| EmbedderError::DownloadFailed(format!("HTTP request failed: {}", e)))?;
 
@@ -260,13 +314,29 @@ fn download_file(url: &str, dest: &Path) -> Result<(), EmbedderError> {
         ));
     }
 
-    // Write to temporary file then rename (atomic-ish)
+    // Write to a temporary file, verify it, then atomically rename it.
     let tmp_path = dest.with_extension("tmp");
     std::fs::write(&tmp_path, &bytes).map_err(EmbedderError::Io)?;
+    if let Err(error) = verify_checksum(&tmp_path, expected_sha256) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(error);
+    }
     std::fs::rename(&tmp_path, dest).map_err(EmbedderError::Io)?;
 
     tracing::info!("Downloaded {} bytes to {}", bytes.len(), dest.display());
 
+    Ok(())
+}
+
+fn verify_checksum(path: &Path, expected: &str) -> Result<(), EmbedderError> {
+    let data = std::fs::read(path).map_err(EmbedderError::Io)?;
+    let actual = format!("{:x}", Sha256::digest(data));
+    if actual != expected {
+        return Err(EmbedderError::ChecksumMismatch {
+            expected: expected.to_string(),
+            actual,
+        });
+    }
     Ok(())
 }
 
@@ -275,22 +345,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_tokenize_output_length() {
-        // Verify that tokenize always produces MAX_SEQ_LENGTH outputs
-        // This test requires a tokenizer.json file, so we create a minimal one
-        // In integration tests, the real tokenizer would be used
-        let model_dir = std::env::temp_dir().join("seekr_test_tokenizer");
-        if let Ok(embedder) = OnnxEmbedder::new(&model_dir) {
-            let (ids, mask) = embedder.tokenize("hello world");
-            assert_eq!(ids.len(), MAX_SEQ_LENGTH);
-            assert_eq!(mask.len(), MAX_SEQ_LENGTH);
+    fn test_checksum_verification() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("asset");
+        std::fs::write(&path, b"seekr").unwrap();
+        assert!(
+            verify_checksum(
+                &path,
+                "0b65795361a56f1add35c621fa94a533a0d08470f3f049e4a02125bc91710bb3"
+            )
+            .is_ok()
+        );
+        assert!(matches!(
+            verify_checksum(&path, "bad"),
+            Err(EmbedderError::ChecksumMismatch { .. })
+        ));
+    }
 
-            // First token should be [CLS] = 101
-            assert_eq!(ids[0], 101);
-
-            // There should be active tokens (attention_mask = 1)
-            let active: i64 = mask.iter().sum();
-            assert!(active > 0, "Should have at least some active tokens");
+    #[test]
+    fn test_model_manifest_has_valid_checksums() {
+        for artifact in MODEL_ARTIFACTS {
+            assert!(artifact.filename.ends_with(".onnx"));
+            assert_eq!(artifact.sha256.len(), 64);
+            assert!(artifact.sha256.bytes().all(|b| b.is_ascii_hexdigit()));
         }
     }
 

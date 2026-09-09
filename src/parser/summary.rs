@@ -41,7 +41,7 @@ pub fn generate_summary(chunk: &CodeChunk) -> String {
         if !doc_trimmed.is_empty() {
             // Limit doc comment length to avoid overwhelming the embedding
             let truncated = if doc_trimmed.len() > 500 {
-                format!("{}...", &doc_trimmed[..500])
+                format!("{}...", truncate_utf8(doc_trimmed, 500))
             } else {
                 doc_trimmed.to_string()
             };
@@ -56,6 +56,18 @@ pub fn generate_summary(chunk: &CodeChunk) -> String {
     }
 
     parts.join("\n")
+}
+
+fn truncate_utf8(value: &str, max_bytes: usize) -> &str {
+    if value.len() <= max_bytes {
+        return value;
+    }
+
+    let mut boundary = max_bytes;
+    while !value.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    &value[..boundary]
 }
 
 /// Extract a brief snippet from the body, skipping boilerplate.
@@ -145,5 +157,21 @@ mod tests {
         let summaries = generate_summaries(&chunks);
         assert_eq!(summaries.len(), 2);
         assert_eq!(summaries[0].0, 1); // chunk id
+    }
+
+    #[test]
+    fn test_generate_summary_truncates_utf8_safely() {
+        let doc = "中".repeat(200);
+        let chunk = make_chunk(
+            ChunkKind::Function,
+            "utf8",
+            None,
+            Some(&doc),
+            "fn utf8() {}",
+        );
+        let summary = generate_summary(&chunk);
+
+        assert!(summary.contains("中中中..."));
+        assert!(summary.is_char_boundary(summary.len()));
     }
 }
