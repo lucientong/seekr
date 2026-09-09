@@ -17,14 +17,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::config::SeekrConfig;
-use crate::embedder::batch::BatchEmbedder;
 use crate::embedder::traits::Embedder;
+use crate::index::builder::{BuildStatus, IndexBuilder};
 use crate::index::store::SeekrIndex;
-use crate::parser::CodeChunk;
-use crate::parser::chunker::chunk_file_from_path;
-use crate::parser::summary::generate_summary;
-use crate::scanner::filter::should_index_file;
-use crate::scanner::walker::walk_directory;
 use crate::search::engine::{SearchEngine, SearchOptions};
 use crate::search::{SearchMode, SearchResult};
 
@@ -453,67 +448,17 @@ fn handle_tool_index(
         .get("path")
         .and_then(|v| v.as_str())
         .unwrap_or(".");
+    let force = arguments
+        .get("force")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
 
     let project_path = Path::new(path_str)
         .canonicalize()
         .unwrap_or_else(|_| Path::new(path_str).to_path_buf());
 
-    let start = Instant::now();
-
-    // Scan
-    let scan_result = match walk_directory(&project_path, config) {
-        Ok(r) => r,
-        Err(e) => {
-            return JsonRpcResponse::error(id, ERROR_INTERNAL, format!("Scan failed: {}", e));
-        }
-    };
-
-    let entries: Vec<_> = scan_result
-        .entries
-        .iter()
-        .filter(|e| should_index_file(&e.path, e.size, config.max_file_size))
-        .collect();
-
-    // Parse
-    let mut all_chunks: Vec<CodeChunk> = Vec::new();
-    let mut parsed_files = 0;
-
-    for entry in &entries {
-        if let Ok(Some(parse_result)) = chunk_file_from_path(&entry.path) {
-            all_chunks.extend(parse_result.chunks);
-            parsed_files += 1;
-        }
-    }
-
-    if all_chunks.is_empty() {
-        return JsonRpcResponse::success(
-            id,
-            serde_json::json!({
-                "content": [{
-                    "type": "text",
-                    "text": "No code chunks found in the project. Nothing to index.",
-                }]
-            }),
-        );
-    }
-
-    // Embed
-    let summaries: Vec<String> = all_chunks.iter().map(generate_summary).collect();
-
-    let embeddings = match create_embedder(config) {
-        Ok(embedder) => {
-            let batch = BatchEmbedder::new(embedder, config.embedding.batch_size);
-            match batch.embed_all(&summaries) {
-                Ok(e) => e,
-                Err(e) => {
-                    return JsonRpcResponse::error(
-                        id,
-                        ERROR_INTERNAL,
-                        format!("Embedding failed: {}", e),
-                    );
-                }
-            }
-        }
+    let embedder = match create_embedder(config) {
+        Ok(embedder) => Arc::from(embedder),
         Err(e) => {
             return JsonRpcResponse::error(
                 id,
@@ -522,43 +467,30 @@ fn handle_tool_index(
             );
         }
     };
-
-    let embedding_dim = embeddings
-        .first()
-        .map(|e: &Vec<f32>| e.len())
-        .unwrap_or(384);
-
-    // Build and save
-    let index = match SeekrIndex::try_build_from(&all_chunks, &embeddings, embedding_dim) {
-        Ok(index) => index,
+    let report = match IndexBuilder::new(config.clone(), embedder).build(&project_path, force) {
+        Ok(report) => report,
         Err(e) => {
-            return JsonRpcResponse::error(
-                id,
-                ERROR_INTERNAL,
-                format!("Index build failed: {}", e),
-            );
+            return JsonRpcResponse::error(id, ERROR_INTERNAL, format!("Indexing failed: {}", e));
         }
     };
-    let index_dir = config.project_index_dir(&project_path);
-
-    if let Err(e) = index.save(&index_dir) {
-        return JsonRpcResponse::error(id, ERROR_INTERNAL, format!("Index save failed: {}", e));
-    }
-
-    let elapsed = start.elapsed();
 
     let message = format!(
-        "Index built successfully!\n\
+        "Index {}.\n\
          • Project: {}\n\
          • Files parsed: {}\n\
          • Code chunks: {}\n\
          • Embedding dim: {}\n\
          • Duration: {:.1}s",
-        project_path.display(),
-        parsed_files,
-        all_chunks.len(),
-        embedding_dim,
-        elapsed.as_secs_f64(),
+        match report.status {
+            BuildStatus::Built => "built successfully",
+            BuildStatus::UpToDate => "is already up to date",
+            BuildStatus::Empty => "contains no code chunks",
+        },
+        report.project_path.display(),
+        report.files_parsed,
+        report.index.chunk_count,
+        report.index.embedding_dim,
+        report.duration.as_secs_f64(),
     );
 
     JsonRpcResponse::success(

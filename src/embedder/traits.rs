@@ -3,6 +3,7 @@
 //! Defines the pluggable backend interface for text embedding.
 
 use crate::error::EmbedderError;
+use std::sync::Arc;
 
 /// Trait for text embedding backends.
 ///
@@ -26,6 +27,20 @@ pub trait Embedder: Send + Sync {
 
 /// Blanket implementation for boxed trait objects.
 impl Embedder for Box<dyn Embedder> {
+    fn embed(&self, text: &str) -> Result<Vec<f32>, EmbedderError> {
+        (**self).embed(text)
+    }
+
+    fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbedderError> {
+        (**self).embed_batch(texts)
+    }
+
+    fn dimension(&self) -> usize {
+        (**self).dimension()
+    }
+}
+
+impl<T: Embedder + ?Sized> Embedder for Arc<T> {
     fn embed(&self, text: &str) -> Result<Vec<f32>, EmbedderError> {
         (**self).embed(text)
     }

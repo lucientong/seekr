@@ -17,14 +17,9 @@ use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 
 use crate::config::SeekrConfig;
-use crate::embedder::batch::BatchEmbedder;
 use crate::embedder::traits::Embedder;
+use crate::index::builder::IndexBuilder;
 use crate::index::store::SeekrIndex;
-use crate::parser::CodeChunk;
-use crate::parser::chunker::chunk_file_from_path;
-use crate::parser::summary::generate_summary;
-use crate::scanner::filter::should_index_file;
-use crate::scanner::walker::walk_directory;
 use crate::search::engine::{SearchEngine, SearchOptions};
 use crate::search::{SearchMode, SearchQuery, SearchResponse};
 
@@ -298,61 +293,10 @@ async fn handle_index(
     Json(req): Json<IndexRequest>,
 ) -> Result<Json<IndexResponse>, (StatusCode, Json<ErrorResponse>)> {
     let config = &state.config;
-    let start = Instant::now();
 
     let project_path = Path::new(&req.path)
         .canonicalize()
         .unwrap_or_else(|_| Path::new(&req.path).to_path_buf());
-
-    // Step 1: Scan files
-    let scan_result = walk_directory(&project_path, config).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: "Scan failed".to_string(),
-                details: Some(e.to_string()),
-            }),
-        )
-    })?;
-
-    let entries: Vec<_> = scan_result
-        .entries
-        .iter()
-        .filter(|e| should_index_file(&e.path, e.size, config.max_file_size))
-        .collect();
-
-    // Step 2: Parse & chunk
-    let mut all_chunks: Vec<CodeChunk> = Vec::new();
-    let mut parsed_files = 0;
-
-    for entry in &entries {
-        match chunk_file_from_path(&entry.path) {
-            Ok(Some(parse_result)) => {
-                all_chunks.extend(parse_result.chunks);
-                parsed_files += 1;
-            }
-            Ok(None) => {}
-            Err(e) => {
-                tracing::debug!(path = %entry.path.display(), error = %e, "Failed to parse file");
-            }
-        }
-    }
-
-    if all_chunks.is_empty() {
-        return Ok(Json(IndexResponse {
-            status: "empty".to_string(),
-            project: project_path.display().to_string(),
-            chunks: 0,
-            files_parsed: 0,
-            embedding_dim: 0,
-            duration_ms: start.elapsed().as_millis(),
-        }));
-    }
-
-    // Step 3: Generate summaries
-    let summaries: Vec<String> = all_chunks.iter().map(generate_summary).collect();
-
-    // Step 4: Generate embeddings
     let embedder = create_embedder(config).map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -362,53 +306,30 @@ async fn handle_index(
             }),
         )
     })?;
-    let batch = BatchEmbedder::new(embedder, config.embedding.batch_size);
-    let embeddings = batch.embed_all(&summaries).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: "Embedding failed".to_string(),
-                details: Some(e.to_string()),
-            }),
-        )
-    })?;
-
-    let embedding_dim = embeddings
-        .first()
-        .map(|e: &Vec<f32>| e.len())
-        .unwrap_or(384);
-
-    // Step 5: Build and save index
-    let index =
-        SeekrIndex::try_build_from(&all_chunks, &embeddings, embedding_dim).map_err(|e| {
+    let report = IndexBuilder::new(config.clone(), Arc::from(embedder))
+        .build(&project_path, req.force)
+        .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse {
-                    error: "Index build failed".to_string(),
+                    error: "Indexing failed".to_string(),
                     details: Some(e.to_string()),
                 }),
             )
         })?;
-    let index_dir = config.project_index_dir(&project_path);
-    index.save(&index_dir).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: "Index save failed".to_string(),
-                details: Some(e.to_string()),
-            }),
-        )
-    })?;
-
-    let elapsed = start.elapsed();
 
     Ok(Json(IndexResponse {
-        status: "ok".to_string(),
-        project: project_path.display().to_string(),
-        chunks: all_chunks.len(),
-        files_parsed: parsed_files,
-        embedding_dim,
-        duration_ms: elapsed.as_millis(),
+        status: match report.status {
+            crate::index::builder::BuildStatus::Built => "ok",
+            crate::index::builder::BuildStatus::UpToDate => "up_to_date",
+            crate::index::builder::BuildStatus::Empty => "empty",
+        }
+        .to_string(),
+        project: report.project_path.display().to_string(),
+        chunks: report.index.chunk_count,
+        files_parsed: report.files_parsed,
+        embedding_dim: report.index.embedding_dim,
+        duration_ms: report.duration.as_millis(),
     }))
 }
 

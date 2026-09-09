@@ -5,6 +5,7 @@
 //! incremental updates.
 
 pub(crate) mod atomic;
+pub mod builder;
 pub mod incremental;
 pub mod mmap_store;
 pub mod store;
