@@ -12,7 +12,7 @@
 # IDE
 .vscode/
 .idea/
-.codebuddy/
+.cursor/
 *.swp
 *.swo
 *~
