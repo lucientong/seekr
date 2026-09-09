@@ -127,8 +127,10 @@ seekr-code serve --watch /path/to/project
 ```bash
 curl -X POST http://127.0.0.1:7720/search \
   -H "Content-Type: application/json" \
-  -d '{"query": "authenticate user", "mode": "hybrid", "top_k": 10}'
+  -d '{"query": "authenticate user", "mode": "hybrid", "top_k": 10, "session_id": "agent-task-42", "max_tokens": 4000}'
 ```
+
+同一项目中使用相同 `session_id` 重复搜索时，将排除该会话已经返回过的代码块。
 
 ### MCP 服务器（AI 编辑器集成）
 
@@ -142,6 +144,8 @@ seekr-code serve --mcp
 - `seekr_search` — 搜索代码，支持文本、语义、AST 和混合模式
 - `seekr_index` — 构建/重建搜索索引
 - `seekr_status` — 获取索引状态
+
+每个 MCP 连接会自动记录并排除已经返回过的代码块。
 
 **MCP 配置示例**（Claude Desktop、CodeBuddy 等）：
 

@@ -7,4 +7,5 @@ pub mod cli;
 pub mod daemon;
 pub mod http;
 pub mod mcp;
+pub mod session_dedup;
 pub mod state;

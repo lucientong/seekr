@@ -88,6 +88,7 @@ impl JsonRpcResponse {
 const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
 const SEEKR_MCP_NAME: &str = "seekr-code";
 const SEEKR_MCP_VERSION: &str = env!("CARGO_PKG_VERSION");
+const MCP_CONNECTION_SESSION_ID: &str = "mcp-stdio-connection";
 
 // JSON-RPC error codes
 const ERROR_PARSE: i32 = -32700;
@@ -147,7 +148,7 @@ pub fn run_mcp_stdio(config: &SeekrConfig) -> Result<(), crate::error::ServerErr
             continue;
         }
 
-        if let Some(response) = handle_request(&request, &registry) {
+        if let Some(response) = handle_request(&request, &registry, MCP_CONNECTION_SESSION_ID) {
             write_response(&mut stdout, &response);
         }
     }
@@ -165,7 +166,11 @@ fn write_response(writer: &mut impl Write, response: &JsonRpcResponse) {
 }
 
 /// Route an incoming MCP request to the appropriate handler.
-fn handle_request(request: &JsonRpcRequest, registry: &EngineRegistry) -> Option<JsonRpcResponse> {
+fn handle_request(
+    request: &JsonRpcRequest,
+    registry: &EngineRegistry,
+    session_id: &str,
+) -> Option<JsonRpcResponse> {
     if request.id.is_none() {
         match request.method.as_str() {
             "notifications/initialized" | "initialized" => {
@@ -185,7 +190,7 @@ fn handle_request(request: &JsonRpcRequest, registry: &EngineRegistry) -> Option
         "tools/list" => handle_tools_list(request),
 
         // MCP tool invocation
-        "tools/call" => handle_tools_call(request, registry),
+        "tools/call" => handle_tools_call(request, registry, session_id),
 
         // Unknown method
         _ => JsonRpcResponse::error(
@@ -315,7 +320,11 @@ fn handle_tools_list(request: &JsonRpcRequest) -> JsonRpcResponse {
 // MCP Tools invocation
 // ============================================================
 
-fn handle_tools_call(request: &JsonRpcRequest, registry: &EngineRegistry) -> JsonRpcResponse {
+fn handle_tools_call(
+    request: &JsonRpcRequest,
+    registry: &EngineRegistry,
+    session_id: &str,
+) -> JsonRpcResponse {
     let params = match &request.params {
         Some(p) => p,
         None => {
@@ -334,7 +343,7 @@ fn handle_tools_call(request: &JsonRpcRequest, registry: &EngineRegistry) -> Jso
         .unwrap_or(Value::Object(Default::default()));
 
     match tool_name {
-        "seekr_search" => handle_tool_search(request.id.clone(), &arguments, registry),
+        "seekr_search" => handle_tool_search(request.id.clone(), &arguments, registry, session_id),
         "seekr_index" => handle_tool_index(request.id.clone(), &arguments, registry),
         "seekr_status" => handle_tool_status(request.id.clone(), &arguments, registry.config()),
         _ => JsonRpcResponse::error(
@@ -350,6 +359,7 @@ fn handle_tool_search(
     id: Option<Value>,
     arguments: &Value,
     registry: &EngineRegistry,
+    session_id: &str,
 ) -> JsonRpcResponse {
     let query = arguments
         .get("query")
@@ -424,6 +434,9 @@ fn handle_tool_search(
             project_path.join(prefix)
         }
     });
+    let excluded_chunk_ids = registry
+        .session_dedup()
+        .seen_chunk_ids(&project_path, session_id);
     let results = match engine.search(
         query,
         search_mode,
@@ -433,11 +446,17 @@ fn handle_tool_search(
             max_tokens,
             path_prefix,
             languages,
+            excluded_chunk_ids,
         },
     ) {
         Ok(results) => results,
         Err(e) => return JsonRpcResponse::error(id, ERROR_INTERNAL, e.to_string()),
     };
+    registry.session_dedup().record_returned(
+        &project_path,
+        session_id,
+        results.iter().map(|result| result.chunk.id),
+    );
 
     let elapsed = start.elapsed();
 
@@ -692,7 +711,7 @@ mod tests {
                 method: method.to_string(),
                 params: None,
             };
-            assert!(handle_request(&request, &registry).is_none());
+            assert!(handle_request(&request, &registry, MCP_CONNECTION_SESSION_ID).is_none());
         }
     }
 }

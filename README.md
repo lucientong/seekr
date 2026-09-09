@@ -127,8 +127,10 @@ seekr-code serve --watch /path/to/project
 ```bash
 curl -X POST http://127.0.0.1:7720/search \
   -H "Content-Type: application/json" \
-  -d '{"query": "authenticate user", "mode": "hybrid", "top_k": 10}'
+  -d '{"query": "authenticate user", "mode": "hybrid", "top_k": 10, "session_id": "agent-task-42", "max_tokens": 4000}'
 ```
+
+Repeated searches with the same `session_id` suppress chunks already returned in that project.
 
 ### MCP Server (AI Editor Integration)
 
@@ -142,6 +144,8 @@ seekr-code serve --mcp
 - `seekr_search` — Search code (text, semantic, AST, hybrid modes)
 - `seekr_index` — Build/rebuild the search index
 - `seekr_status` — Get index status
+
+`seekr_search` automatically suppresses repeated chunks for the lifetime of each MCP connection.
 
 **Example MCP configuration** (e.g., for Claude Desktop, CodeBuddy, etc.):
 

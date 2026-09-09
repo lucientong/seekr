@@ -46,6 +46,10 @@ pub struct SearchQuery {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<usize>,
 
+    /// Optional session identifier used for result de-duplication.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+
     /// Project path to search in.
     pub project_path: String,
 }

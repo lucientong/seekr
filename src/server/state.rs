@@ -14,6 +14,7 @@ use crate::index::builder::{BuildStatus, IndexBuilder};
 use crate::index::store::SeekrIndex;
 use crate::search::engine::{SearchEngine, SearchOptions};
 use crate::search::{SearchMode, SearchResult};
+use crate::server::session_dedup::SessionDedupStore;
 
 pub struct ProjectEngine {
     project_path: PathBuf,
@@ -189,6 +190,7 @@ mod tests {
 pub struct EngineRegistry {
     config: SeekrConfig,
     engines: Arc<RwLock<HashMap<PathBuf, Arc<ProjectEngine>>>>,
+    session_dedup: SessionDedupStore,
 }
 
 impl EngineRegistry {
@@ -196,11 +198,16 @@ impl EngineRegistry {
         Self {
             config,
             engines: Arc::new(RwLock::new(HashMap::new())),
+            session_dedup: SessionDedupStore::default(),
         }
     }
 
     pub fn config(&self) -> &SeekrConfig {
         &self.config
+    }
+
+    pub fn session_dedup(&self) -> &SessionDedupStore {
+        &self.session_dedup
     }
 
     pub fn get_or_create(&self, project_path: &Path) -> Result<Arc<ProjectEngine>, SeekrError> {

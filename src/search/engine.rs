@@ -24,6 +24,7 @@ pub struct SearchOptions {
     pub max_tokens: Option<usize>,
     pub path_prefix: Option<PathBuf>,
     pub languages: Vec<String>,
+    pub excluded_chunk_ids: HashSet<u64>,
 }
 
 impl Default for SearchOptions {
@@ -34,6 +35,7 @@ impl Default for SearchOptions {
             max_tokens: None,
             path_prefix: None,
             languages: Vec::new(),
+            excluded_chunk_ids: HashSet::new(),
         }
     }
 }
@@ -59,6 +61,11 @@ impl SearchEngine {
         let has_filters = options.path_prefix.is_some() || !options.languages.is_empty();
         let candidate_limit = if has_filters {
             index.chunk_count
+        } else if !options.excluded_chunk_ids.is_empty() {
+            options
+                .top_k
+                .saturating_add(options.excluded_chunk_ids.len())
+                .min(index.chunk_count)
         } else {
             options.top_k
         };
@@ -84,6 +91,9 @@ impl SearchEngine {
                     || (!languages.is_empty()
                         && !languages.contains(&chunk.language.to_lowercase()))
                 {
+                    return None;
+                }
+                if options.excluded_chunk_ids.contains(&chunk.id) {
                     return None;
                 }
                 Some(SearchResult {
@@ -231,6 +241,7 @@ mod tests {
                     max_tokens: None,
                     path_prefix: Some(PathBuf::from("src")),
                     languages: vec!["rust".to_string()],
+                    excluded_chunk_ids: HashSet::new(),
                 },
             )
             .unwrap();
@@ -305,5 +316,37 @@ mod tests {
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].chunk.id, baseline[0].chunk.id);
+    }
+
+    #[test]
+    fn overfetches_to_replace_session_duplicates() {
+        let chunks = vec![
+            chunk(1, "src/a.rs", "rust", "fn shared() {}"),
+            chunk(2, "src/b.rs", "rust", "fn shared() {}"),
+            chunk(3, "src/c.rs", "rust", "fn shared() {}"),
+        ];
+        let index = SeekrIndex::build_from(&chunks, &vec![vec![1.0; 8]; 3], 8);
+        let engine = SearchEngine::new(SearchConfig::default(), None);
+
+        let results = engine
+            .search(
+                &index,
+                "shared",
+                SearchMode::Text,
+                &SearchOptions {
+                    top_k: 2,
+                    excluded_chunk_ids: HashSet::from([1]),
+                    ..SearchOptions::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            results
+                .iter()
+                .map(|result| result.chunk.id)
+                .collect::<Vec<_>>(),
+            vec![2, 3]
+        );
     }
 }

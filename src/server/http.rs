@@ -53,6 +53,10 @@ pub struct SearchRequest {
     #[serde(default)]
     pub max_tokens: Option<usize>,
 
+    /// Optional session identifier for suppressing previously returned chunks.
+    #[serde(default)]
+    pub session_id: Option<String>,
+
     /// Project path to search in.
     #[serde(default = "default_path")]
     pub project_path: String,
@@ -213,6 +217,28 @@ async fn handle_search(
     let project_path = Path::new(&req.project_path)
         .canonicalize()
         .unwrap_or_else(|_| Path::new(&req.project_path).to_path_buf());
+    let session_id = req.session_id.filter(|session_id| !session_id.is_empty());
+    if session_id
+        .as_ref()
+        .is_some_and(|session_id| session_id.len() > 128)
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "Invalid session ID".to_string(),
+                details: Some("session_id must not exceed 128 bytes".to_string()),
+            }),
+        ));
+    }
+    let excluded_chunk_ids = session_id
+        .as_deref()
+        .map(|session_id| {
+            state
+                .registry
+                .session_dedup()
+                .seen_chunk_ids(&project_path, session_id)
+        })
+        .unwrap_or_default();
 
     let engine = state
         .registry
@@ -248,6 +274,7 @@ async fn handle_search(
                 max_tokens,
                 path_prefix,
                 languages: req.languages,
+                excluded_chunk_ids,
             },
         )
         .await
@@ -266,6 +293,13 @@ async fn handle_search(
                 }),
             )
         })?;
+    if let Some(session_id) = session_id.as_deref() {
+        state.registry.session_dedup().record_returned(
+            &project_path,
+            session_id,
+            results.iter().map(|result| result.chunk.id),
+        );
+    }
 
     let elapsed = start.elapsed();
     let total = results.len();
@@ -282,6 +316,7 @@ async fn handle_search(
             top_k,
             max_results,
             max_tokens,
+            session_id,
             project_path: project_path.display().to_string(),
         },
     };
@@ -400,5 +435,6 @@ mod tests {
         assert_eq!(request.top_k, 20);
         assert_eq!(request.max_results, None);
         assert_eq!(request.max_tokens, None);
+        assert_eq!(request.session_id, None);
     }
 }

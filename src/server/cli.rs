@@ -163,6 +163,7 @@ pub fn cmd_search(
                 top_k,
                 max_results,
                 max_tokens,
+                session_id: None,
                 project_path: project_path.display().to_string(),
             },
         };

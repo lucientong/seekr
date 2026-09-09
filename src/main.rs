@@ -157,6 +157,7 @@ fn main() -> anyhow::Result<()> {
                     max_tokens,
                     path_prefix: path_prefix.map(Into::into),
                     languages,
+                    excluded_chunk_ids: Default::default(),
                 },
                 &config,
                 cli.json,
