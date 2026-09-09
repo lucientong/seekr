@@ -63,7 +63,7 @@ pub fn search_text_regex(
 
     let mut matches: Vec<TextMatch> = Vec::new();
 
-    for (chunk_id, chunk) in &index.chunks {
+    for (chunk_id, chunk) in index.iter_chunks() {
         let mut matched_lines = Vec::new();
 
         for (line_idx, line) in chunk.body.lines().enumerate() {

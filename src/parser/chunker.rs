@@ -84,8 +84,12 @@ pub fn chunk_file(
         }
     }
 
+    let call_sites =
+        crate::parser::callsites::extract_call_sites(&root, source, path, lang, &chunks);
+
     Ok(ParseResult {
         chunks,
+        call_sites,
         language: lang.name().to_string(),
     })
 }

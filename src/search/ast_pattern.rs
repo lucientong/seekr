@@ -149,7 +149,7 @@ pub fn search_ast_pattern(
 
     let mut matches: Vec<AstMatch> = Vec::new();
 
-    for chunk in index.chunks.values() {
+    for (_chunk_id, chunk) in index.iter_chunks() {
         let score = match_chunk(&parsed, chunk);
         if score > 0.0 {
             matches.push(AstMatch {

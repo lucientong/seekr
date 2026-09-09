@@ -19,6 +19,7 @@ use crate::config::SeekrConfig;
 use crate::index::builder::BuildStatus;
 use crate::index::store::SeekrIndex;
 use crate::search::engine::SearchOptions;
+use crate::search::references::ReferenceOptions;
 use crate::search::symbol::SymbolOptions;
 use crate::search::{SearchMode, SearchResult};
 use crate::server::state::EngineRegistry;
@@ -350,6 +351,72 @@ fn handle_tools_list(request: &JsonRpcRequest) -> JsonRpcResponse {
                 }
             },
             {
+                "name": "seekr_references",
+                "description": "Find name-level references (definition ↔ call-site mentions) for a symbol. Tree-sitter name inference only — not compiler/LSP resolution. Returns confidence scores and reasons.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "name": {
+                            "type": "string",
+                            "description": "Callee / definition name to resolve (case-insensitive)."
+                        },
+                        "project_path": {
+                            "type": "string",
+                            "description": "Project directory containing the index.",
+                            "default": "."
+                        },
+                        "path_prefix": {
+                            "type": "string",
+                            "description": "Optional path prefix relative to the project root."
+                        },
+                        "languages": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "Optional language names to include."
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "description": "Optional maximum number of reference hits."
+                        }
+                    },
+                    "required": ["name"]
+                }
+            },
+            {
+                "name": "seekr_callers",
+                "description": "Find name-level callers (call-site mentions) of a symbol. Tree-sitter name inference only — not compiler/LSP resolution. Returns confidence scores and reasons.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "name": {
+                            "type": "string",
+                            "description": "Callee name to find callers for (case-insensitive)."
+                        },
+                        "project_path": {
+                            "type": "string",
+                            "description": "Project directory containing the index.",
+                            "default": "."
+                        },
+                        "path_prefix": {
+                            "type": "string",
+                            "description": "Optional path prefix relative to the project root."
+                        },
+                        "languages": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "Optional language names to include."
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "description": "Optional maximum number of caller hits."
+                        }
+                    },
+                    "required": ["name"]
+                }
+            },
+            {
                 "name": "seekr_status",
                 "description": "Get the index status for a project. Returns information about whether the project is indexed, how many chunks exist, and the index version.",
                 "inputSchema": {
@@ -401,6 +468,8 @@ fn handle_tools_call(
             handle_tool_symbol_definition(request.id.clone(), &arguments, registry)
         }
         "seekr_symbols" => handle_tool_symbols(request.id.clone(), &arguments, registry),
+        "seekr_references" => handle_tool_references(request.id.clone(), &arguments, registry),
+        "seekr_callers" => handle_tool_callers(request.id.clone(), &arguments, registry),
         "seekr_index" => handle_tool_index(request.id.clone(), &arguments, registry),
         "seekr_status" => handle_tool_status(request.id.clone(), &arguments, registry.config()),
         _ => JsonRpcResponse::error(
@@ -615,6 +684,165 @@ fn handle_tool_symbol_definition(
     )
 }
 
+fn reference_options_from_args(arguments: &Value, project_path: &Path) -> ReferenceOptions {
+    let path_prefix = arguments
+        .get("path_prefix")
+        .and_then(Value::as_str)
+        .map(|prefix| {
+            let prefix = Path::new(prefix);
+            if prefix.is_absolute() {
+                prefix.to_path_buf()
+            } else {
+                project_path.join(prefix)
+            }
+        });
+    let languages = arguments
+        .get("languages")
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_default();
+    let limit = arguments
+        .get("limit")
+        .and_then(Value::as_u64)
+        .map(|value| value as usize);
+    ReferenceOptions {
+        path_prefix,
+        languages,
+        limit,
+    }
+}
+
+fn handle_tool_references(
+    id: Option<Value>,
+    arguments: &Value,
+    registry: &EngineRegistry,
+) -> JsonRpcResponse {
+    let name = arguments
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    if name.is_empty() {
+        return JsonRpcResponse::error(
+            id,
+            ERROR_INVALID_REQUEST,
+            "Missing symbol name".to_string(),
+        );
+    }
+    let project_path = resolve_project_path(arguments, "project_path");
+    let engine = match registry.get_or_create(&project_path) {
+        Ok(engine) => engine,
+        Err(error) => return JsonRpcResponse::error(id, ERROR_INTERNAL, error.to_string()),
+    };
+    let options = reference_options_from_args(arguments, &project_path);
+    let hits = match engine.references(name, &options) {
+        Ok(hits) => hits,
+        Err(error) => return JsonRpcResponse::error(id, ERROR_INTERNAL, error.to_string()),
+    };
+
+    let mut output = format!(
+        "Tree-sitter name-level inference only — not compiler/LSP resolution.\n\
+         Found {} reference hit(s) for '{}':\n\n",
+        hits.len(),
+        name
+    );
+    for (position, hit) in hits.iter().enumerate() {
+        output.push_str(&format!(
+            "[{}] confidence={:.2} reasons={:?}\n    def: {} {} in {} L{}-L{}\n    mention: {} {:?} in {} L{}-L{}\n    snippet: {}\n\n",
+            position + 1,
+            hit.confidence,
+            hit.reasons,
+            hit.definition.kind,
+            hit.definition.name.as_deref().unwrap_or("<unnamed>"),
+            hit.definition.file_path.display(),
+            hit.definition.line_range.start + 1,
+            hit.definition.line_range.end,
+            hit.mention.call_kind,
+            hit.mention.callee_name,
+            hit.mention.file_path.display(),
+            hit.mention.line_range.start + 1,
+            hit.mention.line_range.end,
+            hit.mention.body.lines().next().unwrap_or(""),
+        ));
+    }
+    JsonRpcResponse::success(
+        id,
+        serde_json::json!({ "content": [{ "type": "text", "text": output }] }),
+    )
+}
+
+fn handle_tool_callers(
+    id: Option<Value>,
+    arguments: &Value,
+    registry: &EngineRegistry,
+) -> JsonRpcResponse {
+    let name = arguments
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    if name.is_empty() {
+        return JsonRpcResponse::error(
+            id,
+            ERROR_INVALID_REQUEST,
+            "Missing symbol name".to_string(),
+        );
+    }
+    let project_path = resolve_project_path(arguments, "project_path");
+    let engine = match registry.get_or_create(&project_path) {
+        Ok(engine) => engine,
+        Err(error) => return JsonRpcResponse::error(id, ERROR_INTERNAL, error.to_string()),
+    };
+    let options = reference_options_from_args(arguments, &project_path);
+    let hits = match engine.callers(name, &options) {
+        Ok(hits) => hits,
+        Err(error) => return JsonRpcResponse::error(id, ERROR_INTERNAL, error.to_string()),
+    };
+
+    let mut output = format!(
+        "Tree-sitter name-level inference only — not compiler/LSP resolution.\n\
+         Found {} caller hit(s) for '{}':\n\n",
+        hits.len(),
+        name
+    );
+    for (position, hit) in hits.iter().enumerate() {
+        let caller = hit
+            .caller_chunk
+            .as_ref()
+            .map(|chunk| {
+                format!(
+                    "{} {}",
+                    chunk.kind,
+                    chunk.name.as_deref().unwrap_or("<unnamed>")
+                )
+            })
+            .unwrap_or_else(|| "<unknown enclosing chunk>".to_string());
+        output.push_str(&format!(
+            "[{}] confidence={:.2} reasons={:?}\n    caller: {}\n    mention: {} {:?} in {} L{}-L{}\n    snippet: {}\n\n",
+            position + 1,
+            hit.confidence,
+            hit.reasons,
+            caller,
+            hit.mention.call_kind,
+            hit.mention.callee_name,
+            hit.mention.file_path.display(),
+            hit.mention.line_range.start + 1,
+            hit.mention.line_range.end,
+            hit.mention.body.lines().next().unwrap_or(""),
+        ));
+    }
+    JsonRpcResponse::success(
+        id,
+        serde_json::json!({ "content": [{ "type": "text", "text": output }] }),
+    )
+}
+
 fn handle_tool_symbols(
     id: Option<Value>,
     arguments: &Value,
@@ -764,9 +992,9 @@ fn handle_tool_status(
                  • Version: {}\n\
                  • Index dir: {}",
                 project_path.display(),
-                index.chunk_count,
-                index.embedding_dim,
-                index.version,
+                index.chunk_count(),
+                index.embedding_dim(),
+                index.format_version(),
                 index_dir.display(),
             ),
             Err(e) => format!(
@@ -899,6 +1127,8 @@ mod tests {
 
         assert!(names.contains(&"seekr_symbol_definition"));
         assert!(names.contains(&"seekr_symbols"));
+        assert!(names.contains(&"seekr_references"));
+        assert!(names.contains(&"seekr_callers"));
     }
 
     #[test]

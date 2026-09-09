@@ -42,11 +42,11 @@ pub fn cmd_index(
         let status = serde_json::json!({
             "status": build_status_name(report.status),
             "project": report.project_path.display().to_string(),
-            "chunks": report.index.chunk_count,
+            "chunks": report.index.chunk_count(),
             "files_found": report.files_found,
             "files_skipped": report.files_skipped,
             "files_parsed": report.files_parsed,
-            "embedding_dim": report.index.embedding_dim,
+            "embedding_dim": report.index.embedding_dim(),
             "incremental": !force,
             "changed_files": report.changed_files,
             "unchanged_files": report.unchanged_files,
@@ -69,7 +69,7 @@ pub fn cmd_index(
             BuildStatus::Built => eprintln!(
                 "  {} Index built: {} chunks in {:.1}s{}",
                 "✓".green(),
-                report.index.chunk_count,
+                report.index.chunk_count(),
                 report.duration.as_secs_f64(),
                 if !force { " (incremental)" } else { "" },
             ),
@@ -236,9 +236,9 @@ pub fn cmd_status(
                     "indexed": true,
                     "project": project_path.display().to_string(),
                     "index_dir": index_dir.display().to_string(),
-                    "chunks": index.chunk_count,
-                    "embedding_dim": index.embedding_dim,
-                    "version": index.version,
+                    "chunks": index.chunk_count(),
+                    "embedding_dim": index.embedding_dim(),
+                    "version": index.format_version(),
                 }),
                 Err(e) => serde_json::json!({
                     "indexed": true,
@@ -268,10 +268,10 @@ pub fn cmd_status(
                 eprintln!(
                     "  {} Chunks: {}",
                     "•".blue(),
-                    index.chunk_count.to_string().green()
+                    index.chunk_count().to_string().green()
                 );
-                eprintln!("  {} Embedding dim: {}", "•".blue(), index.embedding_dim,);
-                eprintln!("  {} Version: {}", "•".blue(), index.version);
+                eprintln!("  {} Embedding dim: {}", "•".blue(), index.embedding_dim(),);
+                eprintln!("  {} Version: {}", "•".blue(), index.format_version());
             }
             Err(e) => {
                 eprintln!("{} Index found but could not load: {}", "⚠".yellow(), e);

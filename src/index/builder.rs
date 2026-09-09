@@ -160,16 +160,22 @@ impl IndexBuilder {
         if let Some(index) = index.as_mut() {
             let removed_ids = state.apply_deletions(&changes.deleted);
             index.remove_chunks(&removed_ids);
+            for file_path in &changes.deleted {
+                index.remove_file_call_sites(file_path);
+            }
             for file_path in &files_to_process {
                 index.remove_chunks(&state.chunk_ids_for_file(file_path));
+                index.remove_file_call_sites(file_path);
             }
         }
 
         let mut chunks = Vec::new();
+        let mut call_sites_by_file: BTreeMap<PathBuf, Vec<_>> = BTreeMap::new();
         let mut files_parsed = 0;
         for (position, file_path) in files_to_process.iter().enumerate() {
             match chunk_file_from_path(file_path) {
                 Ok(Some(parse_result)) => {
+                    call_sites_by_file.insert(file_path.clone(), parse_result.call_sites);
                     chunks.extend(parse_result.chunks);
                     files_parsed += 1;
                 }
@@ -204,7 +210,7 @@ impl IndexBuilder {
         };
         let embedding_dim = index
             .as_ref()
-            .map(|index| index.embedding_dim)
+            .map(|index| index.embedding_dim())
             .unwrap_or_else(|| self.embedder.dimension());
 
         let mut index = if let Some(mut index) = index {
@@ -216,7 +222,11 @@ impl IndexBuilder {
         } else {
             SeekrIndex::try_build_from(&chunks, &embeddings, embedding_dim)?
         };
-        index.version = crate::INDEX_VERSION;
+        index.set_format_version(crate::INDEX_VERSION);
+
+        for (file_path, sites) in call_sites_by_file {
+            index.replace_file_call_sites(&file_path, sites);
+        }
 
         for file_path in &files_to_process {
             let chunk_ids = chunks
@@ -241,7 +251,7 @@ impl IndexBuilder {
             total: 1,
         });
 
-        let status = if index.chunk_count == 0 {
+        let status = if index.chunk_count() == 0 {
             BuildStatus::Empty
         } else {
             BuildStatus::Built
@@ -291,7 +301,7 @@ mod tests {
 
         let first = builder.build(project.path(), false).unwrap();
         assert_eq!(first.status, BuildStatus::Built);
-        assert!(first.index.chunk_count > 0);
+        assert!(first.index.chunk_count() > 0);
 
         let second = builder.build(project.path(), false).unwrap();
         assert_eq!(second.status, BuildStatus::UpToDate);
@@ -300,7 +310,7 @@ mod tests {
         let third = builder.build(project.path(), false).unwrap();
         assert_eq!(third.status, BuildStatus::Empty);
         assert_eq!(third.deleted_files, 1);
-        assert_eq!(third.index.chunk_count, 0);
+        assert_eq!(third.index.chunk_count(), 0);
     }
 
     #[test]
@@ -333,9 +343,8 @@ languages = ["rust", "python"]
         let report = builder.build(project.path(), false).unwrap();
         let indexed_paths: std::collections::HashSet<_> = report
             .index
-            .chunks
-            .values()
-            .map(|chunk| chunk.file_path.clone())
+            .iter_chunks()
+            .map(|(_, chunk)| chunk.file_path.clone())
             .collect();
 
         assert_eq!(report.files_found, 3);

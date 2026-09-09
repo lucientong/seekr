@@ -139,6 +139,72 @@ impl ProjectEngine {
         Ok(index.symbols(prefix, limit))
     }
 
+    pub fn references(
+        &self,
+        name: &str,
+        options: &crate::search::references::ReferenceOptions,
+    ) -> Result<Vec<crate::search::references::ReferenceHit>, SeekrError> {
+        self.ensure_persisted_index()?;
+        let index = self
+            .index
+            .read()
+            .map_err(|error| ServerError::Internal(format!("Index lock poisoned: {error}")))?;
+        let languages: std::collections::HashSet<String> = options
+            .languages
+            .iter()
+            .map(|language| language.to_lowercase())
+            .collect();
+        let mut hits: Vec<_> = index
+            .references(name)
+            .into_iter()
+            .filter(|hit| {
+                options
+                    .path_prefix
+                    .as_ref()
+                    .is_none_or(|prefix| hit.mention.file_path.starts_with(prefix))
+                    && (languages.is_empty()
+                        || languages.contains(&hit.mention.language.to_lowercase()))
+            })
+            .collect();
+        if let Some(limit) = options.limit {
+            hits.truncate(limit);
+        }
+        Ok(hits)
+    }
+
+    pub fn callers(
+        &self,
+        name: &str,
+        options: &crate::search::references::ReferenceOptions,
+    ) -> Result<Vec<crate::search::references::CallerHit>, SeekrError> {
+        self.ensure_persisted_index()?;
+        let index = self
+            .index
+            .read()
+            .map_err(|error| ServerError::Internal(format!("Index lock poisoned: {error}")))?;
+        let languages: std::collections::HashSet<String> = options
+            .languages
+            .iter()
+            .map(|language| language.to_lowercase())
+            .collect();
+        let mut hits: Vec<_> = index
+            .callers(name)
+            .into_iter()
+            .filter(|hit| {
+                options
+                    .path_prefix
+                    .as_ref()
+                    .is_none_or(|prefix| hit.mention.file_path.starts_with(prefix))
+                    && (languages.is_empty()
+                        || languages.contains(&hit.mention.language.to_lowercase()))
+            })
+            .collect();
+        if let Some(limit) = options.limit {
+            hits.truncate(limit);
+        }
+        Ok(hits)
+    }
+
     fn ensure_persisted_index(&self) -> Result<(), SeekrError> {
         if self.has_persisted_index.load(Ordering::Acquire) {
             Ok(())
@@ -158,8 +224,8 @@ impl ProjectEngine {
             status: report.status,
             project_path: report.project_path,
             index_dir: report.index_dir,
-            chunk_count: report.index.chunk_count,
-            embedding_dim: report.index.embedding_dim,
+            chunk_count: report.index.chunk_count(),
+            embedding_dim: report.index.embedding_dim(),
             files_found: report.files_found,
             files_skipped: report.files_skipped,
             files_parsed: report.files_parsed,

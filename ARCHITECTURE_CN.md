@@ -31,8 +31,8 @@ Seekr 是一个 **100% 本地运行** 的代码搜索引擎，组合了三种互
 │  │ 搜索引擎: 文本正则 + 语义向量 + AST 模式 → RRF   │   │
 │  └───────────────────────────────────────────────────┘   │
 │  ┌───────────────────────────────────────────────────┐   │
-│  │ 索引引擎: 向量存储 + 倒排索引 + Chunk 元数据     │   │
-│  │           bincode 持久化 / mmap 零拷贝 / 增量索引 │   │
+│  │ 索引引擎: flat VectorStore + 倒排索引 + Chunk 元数据 │   │
+│  │           SEEKRIDX framed v4 / HNSW sidecar / 增量   │   │
 │  └───────────────────────────────────────────────────┘   │
 │  ┌───────────────────────────────────────────────────┐   │
 │  │ 处理管线: 扫描器(ignore) → 解析器(tree-sitter)   │   │
@@ -61,19 +61,20 @@ src/
 ├── parser/             # 代码解析与分块
 │   ├── treesitter.rs   # 16 种语言支持和语法管理
 │   ├── chunker.rs      # AST 感知的语义分块
+│   ├── callsites.rs    # Rust/TS/Python call-site mention 提取
 │   └── summary.rs      # 结构化代码摘要生成
 ├── embedder/           # 嵌入模型管理
 │   ├── traits.rs       # Embedder trait（可插拔后端接口）
 │   ├── onnx.rs         # ONNX Runtime 后端（all-MiniLM-L6-v2）
 │   └── batch.rs        # BatchEmbedder + DummyEmbedder
 ├── index/              # 索引存储与管理
-│   ├── store.rs        # SeekrIndex：向量 + 倒排 + 元数据
-│   ├── mmap_store.rs   # 内存映射索引（零拷贝）
+│   ├── store.rs        # SeekrIndex：flat VectorStore + 倒排 + 元数据（v4 framed）
 │   └── incremental.rs  # 增量索引（mtime + blake3）
 ├── search/             # 搜索算法
 │   ├── text.rs         # 正则文本搜索
 │   ├── semantic.rs     # 向量相似度搜索
 │   ├── ast_pattern.rs  # AST 模式匹配
+│   ├── references.rs   # 名称级 references / callers
 │   └── fusion.rs       # RRF 融合（二路/三路）
 └── server/             # 接口层
     ├── cli.rs          # CLI 命令处理器
@@ -91,10 +92,11 @@ src/
 ### Parser（解析器）
 
 - **treesitter.rs** — 16 种语言（Rust, Python, JS, TS, Tsx, Go, Java, C, C++, JSON, TOML, YAML, HTML, CSS, Ruby, Bash）
-- **chunker.rs** — AST 递归提取语义块，回退 50 行分块，`AtomicU64` 全局 ID，最小 2 行
+- **chunker.rs** — AST 递归提取语义块，回退 50 行分块，内容寻址 chunk ID，最小 2 行
+- **callsites.rs** — Rust / TypeScript / TSX / Python call-site mention 提取（与 chunking 共用同一棵 AST）
 - **summary.rs** — 生成结构化摘要用于嵌入：kind+name + 语言 + 签名 + 文档注释(≤500字) + 代码片段(5行)
 
-核心类型：`CodeChunk`（id, file_path, language, kind, name, signature, doc_comment, body, byte_range, line_range）
+核心类型：`CodeChunk`、`CallSite`、`ParseResult`（含 `call_sites`）
 
 ### Embedder（嵌入引擎）
 
@@ -104,8 +106,7 @@ src/
 
 ### Index（索引引擎）
 
-- **store.rs** — `SeekrIndex`：向量 HashMap + 倒排索引 + chunk 元数据。bincode 序列化(`index.bin`)，兼容 v1 JSON 回退
-- **mmap_store.rs** — `memmap2` 零拷贝读取
+- **store.rs** — `SeekrIndex`：连续 `VectorStore` + 倒排索引 + chunk 元数据。`SEEKRIDX` framed `index.bin`（`INDEX_VERSION = 4`）；legacy v3 拒绝加载并提示 `seekr-code index --force`
 - **incremental.rs** — mtime 快速路径 + blake3 内容哈希确认
 
 ### Search（搜索引擎）
@@ -113,13 +114,14 @@ src/
 - **text.rs** — 正则匹配，`match_count + density * 10` 评分
 - **semantic.rs** — 嵌入查询 → HNSW 近似最近邻搜索（暴力 KNN 兜底）
 - **ast_pattern.rs** — 自定义模式语法，通配符 `*`，加权评分（kind 0.3, name 0.3, params 0.15, return 0.15, qualifiers 0.1）
+- **references.rs** — 名称级 references/callers，带 confidence/reasons 与免责声明
 - **fusion.rs** — RRF 公式 `score = sum(1/(k + rank + 1))`，k=60，AST 失败时静默降级为二路融合
 
 ### Server（服务层）
 
 - **cli.rs** — `cmd_index()`/`cmd_search()`/`cmd_status()`，支持 `--json` 输出
-- **http.rs** — axum REST API：`POST /search`, `POST /index`, `GET /status`, `GET /health`
-- **mcp.rs** — JSON-RPC 2.0 over stdio，工具：`seekr_search`, `seekr_index`, `seekr_status`
+- **http.rs** — axum REST API：`POST /search`, `POST /index`, `POST /references`, `POST /callers`, `GET /status`, `GET /health`
+- **mcp.rs** — JSON-RPC 2.0 over stdio，工具：`seekr_search`, `seekr_symbol_definition`, `seekr_symbols`, `seekr_references`, `seekr_callers`, `seekr_index`, `seekr_status`
 - **daemon.rs** — 500ms 防抖，事件去重，`Arc<RwLock<SeekrIndex>>` 并发访问
 
 ## 数据流
@@ -149,7 +151,8 @@ HTTP 服务器与 Watch 守护进程共享 `Arc<RwLock<SeekrIndex>>`。守护进
 | 结构体 | 描述 |
 |--------|------|
 | `CodeChunk` | 索引代码的基本单位（id, file_path, language, kind, name, signature, doc_comment, body, ranges） |
-| `SeekrIndex` | 主索引（version, vectors HashMap, inverted_index HashMap, chunks HashMap, embedding_dim, chunk_count） |
+| `CallSite` | 名称级 call-site mention（callee 末段、call_kind、位置、enclosing chunk） |
+| `SeekrIndex` | 主索引（私有字段 + getters；flat VectorStore + inverted + chunks + mentions sidecar） |
 | `FusedResult` | 多源融合结果（chunk_id, fused_score, text/semantic/ast_score, matched_lines） |
 | `AstPattern` | AST 搜索模式（qualifiers, kind, name_pattern, param_patterns, return_pattern） |
 | `IncrementalState` | 增量状态（files HashMap: path → mtime + blake3 hash + chunk_ids） |
@@ -158,13 +161,13 @@ HTTP 服务器与 Watch 守护进程共享 `Arc<RwLock<SeekrIndex>>`。守护进
 
 1. **100% 本地执行** — 搜索无网络调用，仅初次下载模型需联网
 2. **可插拔后端** — `Embedder` trait 支持未来替换嵌入模型
-3. **优雅降级** — AST 失败降级为二路融合；v1 索引自动迁移到 v2
+3. **优雅降级** — AST 失败降级为二路融合；旧索引格式拒绝加载并提示 `--force` 重建（不自动迁移）
 4. **项目隔离** — blake3(canonical_path) 前 16 hex 字符作为索引目录名
 5. **默认增量** — mtime 快速路径 + blake3 确认，避免重处理未变文件
 6. **三重接口** — CLI / HTTP / MCP 共享搜索索引逻辑，行为一致
-7. **零拷贝** — memmap2 零拷贝读取，bincode 替代 JSON 消除解析开销
-8. **HNSW 不持久化** — HNSW 图 `#[serde(skip)]`，加载时从向量数据重建，避免磁盘格式依赖 `instant-distance` 内部结构
-8. **结构化摘要** — 输入嵌入模型的是 kind+name+language+signature+doc+snippet 而非原始代码
+7. **Flat 连续向量** — `VectorStore` 连续存储，便于暴力搜索与 HNSW 构建；`SEEKRIDX` framed 持久化
+8. **HNSW sidecar** — HNSW 图写入版本化 sidecar，指纹校验失败则重建
+9. **结构化摘要** — 输入嵌入模型的是 kind+name+language+signature+doc+snippet 而非原始代码
 
 ## 技术栈
 
@@ -180,7 +183,6 @@ HTTP 服务器与 Watch 守护进程共享 `Arc<RwLock<SeekrIndex>>`。守护进
 | 文件遍历 | ignore 0.4 | .gitignore 感知 |
 | 文件监听 | notify 8.0 | 文件系统事件 |
 | 序列化 | bincode 1.3 + serde 1.0 | 快速二进制持久化 |
-| 内存映射 | memmap2 0.9 | 零拷贝读取 |
 | 哈希 | blake3 1.6 | 内容哈希 + 项目隔离 |
 | 错误处理 | thiserror 2.0 + anyhow 1.0 | 结构化错误 |
 | 正则 | regex 1.11 | 文本搜索 |

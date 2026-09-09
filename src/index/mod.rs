@@ -1,13 +1,11 @@
 //! Index engine module.
 //!
 //! Manages HNSW vector index for semantic search and inverted text index
-//! for keyword search. Supports mmap-based zero-copy loading and
-//! incremental updates.
+//! for keyword search. Supports incremental updates and framed on-disk storage.
 
 pub(crate) mod atomic;
 pub mod builder;
 pub mod incremental;
-pub mod mmap_store;
 pub mod store;
 
 /// An entry in the search index.

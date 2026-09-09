@@ -16,13 +16,15 @@ Supports **text regex** + **semantic vector** + **AST pattern** search — 100% 
 - 🔍 **Text Search** — High-performance regex matching across code
 - 🧠 **Semantic Search** — Local ONNX-based embedding with HuggingFace WordPiece tokenizer + HNSW ANN index, find code by meaning
 - 🌳 **AST Pattern Search** — Match function signatures, structs, classes via Tree-sitter (e.g., `fn(*) -> Result`)
-- ⚡ **Hybrid Mode** — Combine all three via 3-way Reciprocal Rank Fusion (RRF) for best results
+- 🔗 **References / Callers** — Name-level Tree-sitter call-site mentions with confidence scores (not compiler/LSP resolution)
+- ⚡ **Hybrid Mode** — Combine text + semantic + AST via 3-way Reciprocal Rank Fusion (RRF)
 - 📡 **MCP Server** — Model Context Protocol support for AI editor integration
 - 🌐 **HTTP API** — REST API for integration with other tools
 - 🔄 **Incremental Indexing** — Only re-process changed files
 - 👁️ **Watch Daemon** — Real-time file monitoring with automatic incremental re-indexing
 - 🗂️ **15 Languages** — Rust, Python, JavaScript, TypeScript, Go, Java, C, C++, Ruby, Bash, HTML, CSS, JSON, TOML, YAML
 
+> **Breaking change (v2.0):** On-disk index format is now **v4** (`SEEKRIDX` framed + flat vector store + `mentions.bin` sidecar). Older indexes are **not** auto-migrated — run `seekr-code index --force`.
 ## Installation
 
 ### From crates.io
@@ -115,12 +117,14 @@ seekr-code serve --watch /path/to/project
 
 **Endpoints:**
 
-| Method | Path      | Description          |
-|--------|-----------|----------------------|
-| POST   | /search   | Search code          |
-| POST   | /index    | Trigger index build  |
-| GET    | /status   | Query index status   |
-| GET    | /health   | Health check         |
+| Method | Path          | Description                                      |
+|--------|---------------|--------------------------------------------------|
+| POST   | /search       | Search code                                      |
+| POST   | /index        | Trigger index build                              |
+| POST   | /references   | Name-level definition ↔ mention joins            |
+| POST   | /callers      | Name-level caller mentions                       |
+| GET    | /status       | Query index status                               |
+| GET    | /health       | Health check                                     |
 
 **Example:**
 
@@ -128,10 +132,14 @@ seekr-code serve --watch /path/to/project
 curl -X POST http://127.0.0.1:7720/search \
   -H "Content-Type: application/json" \
   -d '{"query": "authenticate user", "mode": "hybrid", "top_k": 10, "session_id": "agent-task-42", "max_tokens": 4000}'
+
+curl -X POST http://127.0.0.1:7720/callers \
+  -H "Content-Type: application/json" \
+  -d '{"name": "authenticate_user", "project_path": ".", "limit": 20}'
 ```
 
 Repeated searches with the same `session_id` suppress chunks already returned in that project.
-
+`/references` and `/callers` are Tree-sitter name-level inference only — not compiler/LSP resolution.
 ### MCP Server (AI Editor Integration)
 
 ```bash
@@ -144,12 +152,13 @@ seekr-code serve --mcp
 - `seekr_search` — Search code (text, semantic, AST, hybrid modes)
 - `seekr_symbol_definition` — Find all name-matched definition candidates
 - `seekr_symbols` — Browse the lightweight indexed symbol catalog
+- `seekr_references` — Join definitions to call-site mentions by normalized name
+- `seekr_callers` — List call-site mentions of a symbol
 - `seekr_index` — Build/rebuild the search index
 - `seekr_status` — Get index status
 
 `seekr_search` automatically suppresses repeated chunks for the lifetime of each MCP connection.
-Symbol tools are lightweight index lookups, not compiler- or LSP-grade resolution.
-
+Symbol / references / callers tools are lightweight index lookups, not compiler- or LSP-grade resolution.
 **Example MCP configuration** (e.g., for Claude Desktop, CodeBuddy, etc.):
 
 ```json
@@ -237,11 +246,19 @@ Invalid TOML, unsupported languages, missing roots, and roots outside the worksp
 ## How It Works
 
 1. **Scanner** — Walks the project directory, respects `.gitignore`, filters by file type/size
-2. **Parser** — Uses Tree-sitter to parse source files into semantic code chunks (functions, classes, structs, etc.)
+2. **Parser** — Uses Tree-sitter to parse source files into semantic code chunks and call-site mentions
 3. **Embedder** — Generates vector embeddings using ONNX Runtime + all-MiniLM-L6-v2 with HuggingFace WordPiece tokenizer
-4. **Index** — Builds inverted text index + HNSW vector index, persisted to disk via bincode binary format
+4. **Index** — Flat contiguous vector store + inverted text index + HNSW sidecar + mentions sidecar (`SEEKRIDX` v4)
 5. **Search** — Text regex, semantic HNSW ANN (with brute-force KNN fallback), AST pattern matching, fused via 3-way RRF
-6. **Watch** — Optional file system monitoring with debounced incremental re-indexing
+6. **References** — Name-level definition ↔ mention joins with confidence reasons
+7. **Watch** — Optional file system monitoring with debounced incremental re-indexing
+
+## Breaking Changes (2.0)
+
+- Index format bumped to **v4**. Legacy v3 (and earlier) indexes are rejected with an explicit rebuild prompt.
+- Rebuild with: `seekr-code index --force`
+- There is **no** automatic migration.
+- Optional design notes: [ast-grep gate](docs/ast-grep-gate.md) (not integrated), [quality gate / no default reranker](docs/quality-gate.md).
 
 ## Benchmarks
 

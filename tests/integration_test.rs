@@ -279,15 +279,15 @@ fn test_index_build_from_fixtures() {
 
     // Build index
     let index = SeekrIndex::build_from(&all_chunks, &embeddings, 64);
-    assert_eq!(index.chunk_count, all_chunks.len());
+    assert_eq!(index.chunk_count(), all_chunks.len());
 
     // Save and load
     let dir = tempfile::tempdir().unwrap();
     index.save(dir.path()).unwrap();
 
     let loaded = SeekrIndex::load(dir.path()).unwrap();
-    assert_eq!(loaded.chunk_count, index.chunk_count);
-    assert_eq!(loaded.embedding_dim, 64);
+    assert_eq!(loaded.chunk_count(), index.chunk_count());
+    assert_eq!(loaded.embedding_dim(), 64);
 }
 
 #[test]
@@ -314,10 +314,10 @@ fn test_index_remove_chunk() {
     };
 
     index.add_entry(entry, chunk);
-    assert_eq!(index.chunk_count, 1);
+    assert_eq!(index.chunk_count(), 1);
 
     index.remove_chunk(1);
-    assert_eq!(index.chunk_count, 0);
+    assert_eq!(index.chunk_count(), 0);
     assert!(index.get_chunk(1).is_none());
 }
 
@@ -462,13 +462,13 @@ fn test_end_to_end_pipeline() {
 
     // Step 5: Build index
     let index = SeekrIndex::build_from(&all_chunks, &embeddings, 64);
-    assert!(index.chunk_count > 0, "Index should have entries");
+    assert!(index.chunk_count() > 0, "Index should have entries");
 
     // Step 6: Save and reload
     let dir = tempfile::tempdir().unwrap();
     index.save(dir.path()).unwrap();
     let loaded_index = SeekrIndex::load(dir.path()).unwrap();
-    assert_eq!(loaded_index.chunk_count, index.chunk_count);
+    assert_eq!(loaded_index.chunk_count(), index.chunk_count());
 
     // Step 7: Text search
     let text_options = TextSearchOptions {

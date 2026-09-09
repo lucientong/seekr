@@ -60,12 +60,12 @@ impl SearchEngine {
     ) -> Result<Vec<SearchResult>, SearchError> {
         let has_filters = options.path_prefix.is_some() || !options.languages.is_empty();
         let candidate_limit = if has_filters {
-            index.chunk_count
+            index.chunk_count()
         } else if !options.excluded_chunk_ids.is_empty() {
             options
                 .top_k
                 .saturating_add(options.excluded_chunk_ids.len())
-                .min(index.chunk_count)
+                .min(index.chunk_count())
         } else {
             options.top_k
         };

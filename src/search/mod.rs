@@ -6,6 +6,7 @@
 pub mod ast_pattern;
 pub mod engine;
 pub mod fusion;
+pub mod references;
 pub mod semantic;
 pub mod symbol;
 pub mod text;

@@ -72,8 +72,8 @@ No data ever leaves your machine. The entire pipeline — scanning, parsing, emb
 │  │  └──────────┘  └──────────┘  └────────────────────────┘ │    │
 │  │                                                          │    │
 │  │  ┌──────────┐  ┌──────────────┐  ┌──────────────────┐   │    │
-│  │  │ bincode  │  │ Incremental  │  │   Mmap Store     │   │    │
-│  │  │ persist  │  │ State        │  │   (zero-copy)    │   │    │
+│  │  │ framed   │  │ Incremental  │  │   Flat Vector    │   │    │
+│  │  │ index.bin│  │ State        │  │   Store (v4)     │   │    │
 │  │  └──────────┘  └──────────────┘  └──────────────────┘   │    │
 │  └──────────────────────────────────────────────────────────┘    │
 │                                                                  │
@@ -108,9 +108,10 @@ src/
 │   ├── filter.rs       # File filtering (extension, size, binary detection)
 │   └── watcher.rs      # File system event monitoring (notify crate)
 ├── parser/             # Code parsing and chunking
-│   ├── mod.rs          # Core types (CodeChunk, ChunkKind, ParseResult)
+│   ├── mod.rs          # Core types (CodeChunk, CallSite, ParseResult)
 │   ├── treesitter.rs   # Language support (16 languages) and grammar management
 │   ├── chunker.rs      # AST-aware semantic chunking
+│   ├── callsites.rs    # Rust/TS/Python call-site mention extraction
 │   └── summary.rs      # Structured code summary generation
 ├── embedder/           # Embedding model management
 │   ├── mod.rs          # Module re-exports
@@ -119,14 +120,14 @@ src/
 │   └── batch.rs        # BatchEmbedder wrapper + DummyEmbedder
 ├── index/              # Index storage and management
 │   ├── mod.rs          # Core types (IndexEntry, SearchHit)
-│   ├── store.rs        # SeekrIndex: vector + inverted + metadata storage
-│   ├── mmap_store.rs   # Memory-mapped index (zero-copy reads)
+│   ├── store.rs        # SeekrIndex: flat VectorStore + inverted + metadata (v4 framed)
 │   └── incremental.rs  # Incremental indexing (mtime + blake3 change detection)
 ├── search/             # Search algorithms
 │   ├── mod.rs          # Module re-exports
 │   ├── text.rs         # Regex-based text search with context lines
 │   ├── semantic.rs     # Vector similarity search (cosine KNN)
 │   ├── ast_pattern.rs  # AST pattern parser and matcher
+│   ├── references.rs   # Name-level references / callers + confidence
 │   └── fusion.rs       # RRF fusion (2-way and 3-way)
 └── server/             # Interface layer
     ├── mod.rs          # Module re-exports
@@ -185,11 +186,10 @@ The index module manages persistent storage for vectors, inverted index, and chu
 | File | Responsibility |
 |------|---------------|
 | `mod.rs` | Core types: `IndexEntry` (chunk_id + embedding + text_tokens), `SearchHit` (chunk_id + score). |
-| `store.rs` | `SeekrIndex` — the main index structure. Contains `vectors: HashMap<u64, Vec<f32>>`, `inverted_index: HashMap<String, Vec<(u64, u32)>>`, `chunks: HashMap<u64, CodeChunk>`. Provides `add_entry()`, `remove_chunk()`, `search_vector()` (brute-force cosine KNN), `search_text()` (inverted index with TF scoring). Serialization: `save()` writes bincode to `index.bin`, `load()` tries bincode first then falls back to JSON for v1 migration. |
-| `mmap_store.rs` | `MmapIndex` — memory-mapped read-only index with zero-copy via `memmap2`. Single `mmap: Mmap` field, `as_bytes()` returns `&self.mmap` directly. |
+| `store.rs` | `SeekrIndex` — private fields with getters. Contiguous `VectorStore` (flat `data` + `row_ids` + `id_to_row`), inverted index, and chunk metadata. Provides `add_entry()`, `remove_chunk()`, `search_vector()` (HNSW with brute-force fallback), `search_text()` (BM25). On-disk format v4: `SEEKRIDX` magic + LE version/length + bincode payload. Legacy v3 indexes are rejected with a `seekr-code index --force` rebuild hint (no auto-migration). |
 | `incremental.rs` | `IncrementalState` — tracks file states (`mtime` + `blake3` content hash + chunk IDs). `detect_changes()` uses mtime as fast-path, blake3 as confirmation. `apply_deletions()` returns chunk IDs to remove. |
 
-**Key design:** Index v2 uses bincode for serialization (replacing JSON in v1), providing significantly faster save/load times. Backward compatibility is maintained by falling back to `index.json` when `index.bin` is not found.
+**Key design:** Index v4 uses a framed binary header plus a flat contiguous vector store for O(1) get/append/swap-remove and cache-friendly HNSW/fingerprint traversal. Older formats must be rebuilt with `--force`.
 
 ### Search (`search`)
 
@@ -211,8 +211,8 @@ The server module provides three interface layers sharing the same search/index 
 | File | Responsibility |
 |------|---------------|
 | `cli.rs` | CLI command handlers: `cmd_index()` (full pipeline with incremental support, progress bars), `cmd_search()` (4 modes with colored output), `cmd_status()` (index status report). JSON output support via `--json` flag. |
-| `http.rs` | axum-based HTTP REST API. Routes: `POST /search`, `POST /index`, `GET /status`, `GET /health`. Uses `Arc<AppState>` with shared config and embedder. |
-| `mcp.rs` | MCP (Model Context Protocol) Server over stdio. Implements JSON-RPC 2.0. Tools: `seekr_search`, `seekr_index`, `seekr_status`. `execute_search()` — shared search logic for all modes including 3-way RRF. |
+| `http.rs` | axum-based HTTP REST API. Routes: `POST /search`, `POST /index`, `POST /references`, `POST /callers`, `GET /status`, `GET /health`. Uses `Arc<AppState>` with shared config and embedder. |
+| `mcp.rs` | MCP (Model Context Protocol) Server over stdio. Implements JSON-RPC 2.0. Tools: `seekr_search`, `seekr_symbol_definition`, `seekr_symbols`, `seekr_references`, `seekr_callers`, `seekr_index`, `seekr_status`. |
 | `daemon.rs` | Watch daemon for real-time incremental indexing. `run_watch_daemon()` — async main loop with 500ms debounce, event dedup, error recovery. Uses `Arc<RwLock<SeekrIndex>>` for concurrent access with HTTP server. |
 
 **Key design:** All three server interfaces (CLI, HTTP, MCP) share the same underlying search/index logic, ensuring consistent behavior across interfaces.
@@ -355,17 +355,17 @@ pub struct CodeChunk {
 
 ### SeekrIndex
 
-The main index structure with three sub-indexes:
+The main index structure (fields are private; use getters):
 
 ```rust
 pub struct SeekrIndex {
-    pub version: u32,         // INDEX_VERSION (currently 2)
-    pub vectors: HashMap<u64, Vec<f32>>,           // Vector index
-    pub inverted_index: HashMap<String, Vec<(u64, u32)>>,  // Text index
-    pub chunks: HashMap<u64, CodeChunk>,           // Metadata store
-    pub embedding_dim: usize, // 384 for all-MiniLM-L6-v2
-    pub chunk_count: usize,   // Total chunks
-    // hnsw: Option<HnswMap> — in-memory HNSW graph (not serialized)
+    version: u32,                 // INDEX_VERSION (currently 4)
+    vectors: VectorStore,         // contiguous f32 buffer + row_ids
+    inverted_index: HashMap<String, Vec<(u64, u32)>>,
+    chunks: HashMap<u64, CodeChunk>,
+    embedding_dim: usize,         // 384 for all-MiniLM-L6-v2
+    chunk_count: usize,
+    // hnsw: Option<HnswMap> — in-memory / sidecar
 }
 ```
 
@@ -390,7 +390,7 @@ pub struct FusedResult {
 
 2. **Pluggable Backends** — The `Embedder` trait allows swapping embedding models without changing the rest of the pipeline. `Box<dyn Embedder>` enables runtime polymorphism.
 
-3. **Graceful Degradation** — AST pattern search failures silently degrade to 2-way fusion. Missing index falls back to helpful error messages. V1 JSON index auto-migrates to v2 bincode.
+3. **Graceful Degradation** — AST pattern search failures silently degrade to 2-way fusion. Missing index falls back to helpful error messages. Legacy index versions require an explicit `--force` rebuild.
 
 4. **Project Isolation** — Each project gets its own index directory via blake3 hash of the canonical path. No cross-project data contamination.
 
@@ -398,7 +398,7 @@ pub struct FusedResult {
 
 6. **Triple Interface Model** — CLI, HTTP REST, and MCP Server all share the same search/index logic, ensuring behavioral consistency across all access methods.
 
-7. **Zero-Copy Where Possible** — Memory-mapped index uses `memmap2` for zero-copy reads. Bincode serialization eliminates JSON parsing overhead.
+7. **Contiguous Vector Storage** — Flat `VectorStore` keeps embeddings in a single buffer for fast traversal, HNSW construction, and fingerprinting. Framed v4 persistence replaces the earlier mmap prototype.
 
 8. **Structured Summaries for Embedding** — Instead of feeding raw code to the embedding model, structured summaries (kind+name+language+signature+doc+snippet) produce better semantic representations for natural language queries.
 
@@ -416,7 +416,6 @@ pub struct FusedResult {
 | File Traversal | ignore 0.4 | .gitignore-aware parallel walk |
 | File Watching | notify 8.0 | File system event monitoring |
 | Serialization | bincode 1.3 + serde 1.0 | Fast binary index persistence |
-| Memory Mapping | memmap2 0.9 | Zero-copy index reads |
 | Hashing | blake3 1.6 | Content hashing + project isolation |
 | Error Handling | thiserror 2.0 + anyhow 1.0 | Structured errors |
 | Regex | regex 1.11 | Text search matching |

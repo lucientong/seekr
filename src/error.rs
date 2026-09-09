@@ -93,7 +93,9 @@ pub enum IndexError {
     #[error("Index not found at '{0}'")]
     NotFound(PathBuf),
 
-    #[error("Index version mismatch: file version {file_version}, expected {expected_version}")]
+    #[error(
+        "Index version mismatch: file version {file_version}, expected {expected_version}. Run `seekr-code index --force` to rebuild."
+    )]
     VersionMismatch {
         file_version: u32,
         expected_version: u32,

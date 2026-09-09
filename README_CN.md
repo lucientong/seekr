@@ -16,12 +16,15 @@
 - 🔍 **文本搜索** — 高性能正则表达式匹配
 - 🧠 **语义搜索** — 基于 ONNX 的本地 Embedding + HuggingFace WordPiece 分词器 + HNSW 近似最近邻索引，按语义查找代码
 - 🌳 **AST 模式搜索** — 通过 Tree-sitter 匹配函数签名、结构体、类（如 `fn(*) -> Result`）
-- ⚡ **混合模式** — 三路倒数排名融合（3-way RRF）组合全部三种搜索，获得最佳结果
+- 🔗 **References / Callers** — Tree-sitter 名称级 call-site mention，带可解释置信度（不是编译器/LSP 解析）
+- ⚡ **混合模式** — 三路倒数排名融合（3-way RRF）组合文本 + 语义 + AST
 - 📡 **MCP 服务器** — 支持 Model Context Protocol，接入 AI 编辑器
 - 🌐 **HTTP API** — REST API，方便与其他工具集成
 - 🔄 **增量索引** — 仅重新处理变更文件
 - 👁️ **Watch Daemon** — 实时文件监控，自动增量重建索引
 - 🗂️ **多语言支持** — Rust、Python、JavaScript、TypeScript、Go、Java、C、C++、Ruby、Bash、HTML、CSS、JSON、TOML、YAML
+
+> **破坏性变更（v2.0）：** 磁盘索引格式升级为 **v4**（`SEEKRIDX` framed + flat 向量存储 + `mentions.bin` sidecar）。旧索引**不会**自动迁移 — 请执行 `seekr-code index --force`。
 
 ## 安装
 
@@ -115,12 +118,14 @@ seekr-code serve --watch /path/to/project
 
 **接口列表：**
 
-| 方法   | 路径      | 说明           |
-|--------|-----------|----------------|
-| POST   | /search   | 搜索代码       |
-| POST   | /index    | 触发索引构建   |
-| GET    | /status   | 查询索引状态   |
-| GET    | /health   | 健康检查       |
+| 方法   | 路径          | 说明                                      |
+|--------|---------------|-------------------------------------------|
+| POST   | /search       | 搜索代码                                  |
+| POST   | /index        | 触发索引构建                              |
+| POST   | /references   | 名称级 definition ↔ mention 联结          |
+| POST   | /callers      | 名称级 caller mentions                    |
+| GET    | /status       | 查询索引状态                              |
+| GET    | /health       | 健康检查                                  |
 
 **示例：**
 
@@ -128,9 +133,14 @@ seekr-code serve --watch /path/to/project
 curl -X POST http://127.0.0.1:7720/search \
   -H "Content-Type: application/json" \
   -d '{"query": "authenticate user", "mode": "hybrid", "top_k": 10, "session_id": "agent-task-42", "max_tokens": 4000}'
+
+curl -X POST http://127.0.0.1:7720/callers \
+  -H "Content-Type: application/json" \
+  -d '{"name": "authenticate_user", "project_path": ".", "limit": 20}'
 ```
 
 同一项目中使用相同 `session_id` 重复搜索时，将排除该会话已经返回过的代码块。
+`/references` 与 `/callers` 仅为 Tree-sitter 名称级推断，不是编译器/LSP 解析。
 
 ### MCP 服务器（AI 编辑器集成）
 
@@ -144,11 +154,13 @@ seekr-code serve --mcp
 - `seekr_search` — 搜索代码，支持文本、语义、AST 和混合模式
 - `seekr_symbol_definition` — 查找所有同名定义候选
 - `seekr_symbols` — 浏览轻量级索引符号目录
+- `seekr_references` — 按归一化名称联结定义与 call-site mentions
+- `seekr_callers` — 列出符号的 call-site mentions
 - `seekr_index` — 构建/重建搜索索引
 - `seekr_status` — 获取索引状态
 
 每个 MCP 连接会自动记录并排除已经返回过的代码块。
-符号工具仅执行轻量级索引查询，不提供编译器或 LSP 级解析。
+符号 / references / callers 工具仅执行轻量级索引查询，不提供编译器或 LSP 级解析。
 
 **MCP 配置示例**（Claude Desktop、CodeBuddy 等）：
 
@@ -237,11 +249,19 @@ max_file_size = 5242880
 ## 工作原理
 
 1. **扫描器（Scanner）** — 遍历项目目录，遵循 `.gitignore`，按文件类型/大小过滤
-2. **解析器（Parser）** — 使用 Tree-sitter 将源文件解析为语义代码块（函数、类、结构体等）
+2. **解析器（Parser）** — 使用 Tree-sitter 解析语义代码块与 call-site mentions
 3. **嵌入器（Embedder）** — 使用 ONNX Runtime + all-MiniLM-L6-v2 + HuggingFace WordPiece 分词器生成向量嵌入
-4. **索引（Index）** — 构建倒排文本索引 + HNSW 向量索引，通过 bincode 二进制格式持久化到磁盘
+4. **索引（Index）** — flat 连续向量存储 + 倒排索引 + HNSW sidecar + mentions sidecar（`SEEKRIDX` v4）
 5. **搜索（Search）** — 文本正则、语义 HNSW 近似最近邻搜索（暴力 KNN 兜底）、AST 模式匹配，通过三路 RRF 融合
-6. **监听（Watch）** — 可选的文件系统监控，支持防抖增量重建索引
+6. **References** — 名称级 definition ↔ mention 联结，附带置信度理由
+7. **监听（Watch）** — 可选的文件系统监控，支持防抖增量重建索引
+
+## 破坏性变更（2.0）
+
+- 索引格式升级为 **v4**。旧版 v3（及更早）索引会被拒绝，并提示强制重建。
+- 重建命令：`seekr-code index --force`
+- **没有**自动迁移。
+- 设计记录：[ast-grep 门禁](docs/ast-grep-gate.md)（未集成）、[质量门禁 / 不需要默认 reranker](docs/quality-gate.md)。
 
 ## 性能基准
 

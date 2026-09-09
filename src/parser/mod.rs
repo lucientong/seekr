@@ -2,6 +2,7 @@
 //!
 //! Uses Tree-sitter for AST parsing and semantic chunking of source code.
 
+pub mod callsites;
 pub mod chunker;
 pub mod summary;
 pub mod treesitter;
@@ -21,6 +22,50 @@ pub enum ChunkKind {
     Module,
     /// Fallback for chunks that don't match any specific kind.
     Block,
+}
+
+/// Surface-syntax call kinds extracted from Tree-sitter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CallKind {
+    Function,
+    Method,
+    Constructor,
+    Macro,
+}
+
+impl CallKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Function => "function",
+            Self::Method => "method",
+            Self::Constructor => "constructor",
+            Self::Macro => "macro",
+        }
+    }
+}
+
+impl std::fmt::Display for CallKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+/// A name-level call-site mention (not a resolved reference edge).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CallSite {
+    pub id: u64,
+    pub file_path: PathBuf,
+    pub language: String,
+    /// Final identifier segment of the callee (`foo` in `a.b.foo`).
+    pub callee_name: String,
+    pub call_kind: CallKind,
+    /// True when the callee was accessed via member / scoped path.
+    pub is_member: bool,
+    pub byte_range: Range<usize>,
+    pub line_range: Range<usize>,
+    pub enclosing_chunk_id: Option<u64>,
+    pub body: String,
 }
 
 /// A semantic chunk of code extracted from a source file.
@@ -62,6 +107,9 @@ pub struct CodeChunk {
 pub struct ParseResult {
     /// Code chunks extracted from the file.
     pub chunks: Vec<CodeChunk>,
+
+    /// Call-site mentions extracted from the same parse tree.
+    pub call_sites: Vec<CallSite>,
 
     /// The detected language.
     pub language: String,

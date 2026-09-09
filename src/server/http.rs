@@ -3,6 +3,8 @@
 //! REST API built with axum, bound to 127.0.0.1 (configurable port):
 //! - `POST /search` — Search code with various modes
 //! - `POST /index`  — Trigger index build for a project
+//! - `POST /references` — Name-level definition↔mention joins
+//! - `POST /callers` — Name-level caller mentions
 //! - `GET  /status` — Query index status for a project
 
 use std::path::Path;
@@ -19,6 +21,7 @@ use tokio::net::TcpListener;
 use crate::config::SeekrConfig;
 use crate::index::store::SeekrIndex;
 use crate::search::engine::SearchOptions;
+use crate::search::references::{CallerHit, ReferenceHit, ReferenceOptions};
 use crate::search::{SearchMode, SearchQuery, SearchResponse};
 use crate::server::state::EngineRegistry;
 
@@ -103,6 +106,34 @@ pub struct IndexResponse {
     pub duration_ms: u128,
 }
 
+/// Request body for `POST /references` and `POST /callers`.
+#[derive(Debug, Deserialize)]
+pub struct ReferenceRequest {
+    pub name: String,
+    #[serde(default = "default_path")]
+    pub project_path: String,
+    #[serde(default)]
+    pub path_prefix: Option<String>,
+    #[serde(default)]
+    pub languages: Vec<String>,
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ReferencesResponse {
+    pub name: String,
+    pub disclaimer: &'static str,
+    pub hits: Vec<ReferenceHit>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CallersResponse {
+    pub name: String,
+    pub disclaimer: &'static str,
+    pub hits: Vec<CallerHit>,
+}
+
 /// Request params for `GET /status`.
 #[derive(Debug, Deserialize)]
 pub struct StatusQuery {
@@ -159,6 +190,8 @@ pub async fn start_http_server_with_registry(
     let app = Router::new()
         .route("/search", post(handle_search))
         .route("/index", post(handle_index))
+        .route("/references", post(handle_references))
+        .route("/callers", post(handle_callers))
         .route("/status", get(handle_status))
         .route("/health", get(handle_health))
         .with_state(state);
@@ -370,6 +403,140 @@ async fn handle_index(
     }))
 }
 
+async fn handle_references(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<ReferenceRequest>,
+) -> Result<Json<ReferencesResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let name = req.name.trim();
+    if name.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "Missing name".to_string(),
+                details: None,
+            }),
+        ));
+    }
+    let (project_path, options) = reference_request_parts(&req);
+    let engine = state
+        .registry
+        .get_or_create_async(project_path)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: "Project engine unavailable".to_string(),
+                    details: Some(e.to_string()),
+                }),
+            )
+        })?;
+    let name = name.to_string();
+    let hits = tokio::task::spawn_blocking(move || engine.references(&name, &options))
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: "References lookup failed".to_string(),
+                    details: Some(e.to_string()),
+                }),
+            )
+        })?
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: "References lookup failed".to_string(),
+                    details: Some(e.to_string()),
+                }),
+            )
+        })?;
+    Ok(Json(ReferencesResponse {
+        name: req.name,
+        disclaimer: crate::search::references::REFERENCES_DISCLAIMER,
+        hits,
+    }))
+}
+
+async fn handle_callers(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<ReferenceRequest>,
+) -> Result<Json<CallersResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let name = req.name.trim();
+    if name.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "Missing name".to_string(),
+                details: None,
+            }),
+        ));
+    }
+    let (project_path, options) = reference_request_parts(&req);
+    let engine = state
+        .registry
+        .get_or_create_async(project_path)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: "Project engine unavailable".to_string(),
+                    details: Some(e.to_string()),
+                }),
+            )
+        })?;
+    let name = name.to_string();
+    let hits = tokio::task::spawn_blocking(move || engine.callers(&name, &options))
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: "Callers lookup failed".to_string(),
+                    details: Some(e.to_string()),
+                }),
+            )
+        })?
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: "Callers lookup failed".to_string(),
+                    details: Some(e.to_string()),
+                }),
+            )
+        })?;
+    Ok(Json(CallersResponse {
+        name: req.name,
+        disclaimer: crate::search::references::REFERENCES_DISCLAIMER,
+        hits,
+    }))
+}
+
+fn reference_request_parts(req: &ReferenceRequest) -> (std::path::PathBuf, ReferenceOptions) {
+    let project_path = Path::new(&req.project_path)
+        .canonicalize()
+        .unwrap_or_else(|_| Path::new(&req.project_path).to_path_buf());
+    let path_prefix = req.path_prefix.as_ref().map(|prefix| {
+        let prefix = Path::new(prefix);
+        if prefix.is_absolute() {
+            prefix.to_path_buf()
+        } else {
+            project_path.join(prefix)
+        }
+    });
+    (
+        project_path,
+        ReferenceOptions {
+            path_prefix,
+            languages: req.languages.clone(),
+            limit: req.limit,
+        },
+    )
+}
+
 /// `GET /status` — Query index status.
 async fn handle_status(
     State(state): State<Arc<AppState>>,
@@ -404,9 +571,9 @@ async fn handle_status(
             indexed: true,
             project: project_path.display().to_string(),
             index_dir: index_dir.display().to_string(),
-            chunks: Some(index.chunk_count),
-            embedding_dim: Some(index.embedding_dim),
-            version: Some(index.version),
+            chunks: Some(index.chunk_count()),
+            embedding_dim: Some(index.embedding_dim()),
+            version: Some(index.format_version()),
             error: None,
             message: None,
         }),
