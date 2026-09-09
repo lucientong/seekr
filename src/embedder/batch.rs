@@ -44,6 +44,13 @@ impl<E: Embedder> BatchEmbedder<E> {
         for chunk in texts.chunks(self.batch_size) {
             let refs: Vec<&str> = chunk.iter().map(|s| s.as_str()).collect();
             let batch_result = self.embedder.embed_batch(&refs)?;
+            if batch_result.len() != chunk.len() {
+                return Err(EmbedderError::OnnxError(format!(
+                    "Batch inference returned {} embeddings for {} inputs",
+                    batch_result.len(),
+                    chunk.len()
+                )));
+            }
             all_embeddings.extend(batch_result);
             completed += chunk.len();
             progress_fn(completed, total);

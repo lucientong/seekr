@@ -4,7 +4,7 @@
 //! and an inverted text index for keyword search. Provides build, query, save,
 //! and load operations.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -40,6 +40,13 @@ struct HnswSidecarRef<'a> {
 
 const HNSW_SIDECAR_VERSION: u32 = 1;
 const HNSW_FILENAME: &str = "hnsw.bin";
+const BM25_K1: f32 = 1.2;
+const BM25_B: f32 = 0.75;
+
+struct Bm25Stats {
+    document_lengths: HashMap<u64, usize>,
+    average_document_length: f32,
+}
 
 impl instant_distance::Point for EmbeddingPoint {
     fn distance(&self, other: &Self) -> f32 {
@@ -80,6 +87,9 @@ pub struct SeekrIndex {
 
     #[serde(skip)]
     index_dir: Option<PathBuf>,
+
+    #[serde(skip)]
+    bm25_stats: OnceLock<Bm25Stats>,
 }
 
 impl std::fmt::Debug for SeekrIndex {
@@ -106,6 +116,7 @@ impl SeekrIndex {
             chunk_count: 0,
             hnsw: OnceLock::new(),
             index_dir: None,
+            bm25_stats: OnceLock::new(),
         }
     }
 
@@ -118,6 +129,7 @@ impl SeekrIndex {
     /// Add an entry while reporting the vanishingly rare hash collision.
     pub fn try_add_entry(&mut self, entry: IndexEntry, chunk: CodeChunk) -> Result<(), IndexError> {
         self.hnsw.take();
+        self.bm25_stats.take();
         let chunk_id = entry.chunk_id;
 
         if let Some(existing) = self.chunks.get(&chunk_id) {
@@ -159,6 +171,7 @@ impl SeekrIndex {
     /// Removes the chunk from vectors, inverted index, and metadata.
     pub fn remove_chunk(&mut self, chunk_id: u64) {
         self.hnsw.take();
+        self.bm25_stats.take();
         // Remove from vector index
         self.vectors.remove(&chunk_id);
 
@@ -385,6 +398,62 @@ impl SeekrIndex {
             .collect()
     }
 
+    /// Rank lexical matches with BM25 for hybrid retrieval.
+    pub fn search_bm25(&self, query: &str, top_k: usize) -> Vec<SearchHit> {
+        let query_tokens: HashSet<String> = tokenize_for_index(query).into_iter().collect();
+        if query_tokens.is_empty() || self.chunks.is_empty() {
+            return Vec::new();
+        }
+        let stats = self.bm25_stats.get_or_init(|| {
+            let document_lengths: HashMap<u64, usize> = self
+                .chunks
+                .iter()
+                .map(|(&chunk_id, chunk)| (chunk_id, tokenize_for_index(&chunk.body).len()))
+                .collect();
+            let average_document_length = document_lengths.values().sum::<usize>() as f32
+                / document_lengths.len().max(1) as f32;
+            Bm25Stats {
+                document_lengths,
+                average_document_length,
+            }
+        });
+        let document_count = self.chunks.len() as f32;
+        let average_length = stats.average_document_length.max(1.0);
+        let mut scores: HashMap<u64, f32> = HashMap::new();
+
+        for token in query_tokens {
+            let Some(postings) = self.inverted_index.get(&token) else {
+                continue;
+            };
+            let document_frequency = postings.len() as f32;
+            let inverse_document_frequency = (1.0
+                + (document_count - document_frequency + 0.5) / (document_frequency + 0.5))
+                .ln();
+            for &(chunk_id, frequency) in postings {
+                let term_frequency = frequency as f32;
+                let document_length =
+                    stats.document_lengths.get(&chunk_id).copied().unwrap_or(0) as f32;
+                let denominator = term_frequency
+                    + BM25_K1 * (1.0 - BM25_B + BM25_B * document_length / average_length);
+                *scores.entry(chunk_id).or_default() +=
+                    inverse_document_frequency * term_frequency * (BM25_K1 + 1.0) / denominator;
+            }
+        }
+
+        let mut results: Vec<SearchHit> = scores
+            .into_iter()
+            .map(|(chunk_id, score)| SearchHit { chunk_id, score })
+            .collect();
+        results.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.chunk_id.cmp(&b.chunk_id))
+        });
+        results.truncate(top_k);
+        results
+    }
+
     /// Get a chunk by its ID.
     pub fn get_chunk(&self, chunk_id: u64) -> Option<&CodeChunk> {
         self.chunks.get(&chunk_id)
@@ -530,10 +599,40 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 ///
 /// Splits on whitespace and punctuation, lowercases, filters short tokens.
 fn tokenize_for_index(text: &str) -> Vec<String> {
-    text.split(|c: char| !c.is_alphanumeric() && c != '_')
-        .map(|s| s.to_lowercase())
-        .filter(|s| s.len() >= 2)
-        .collect()
+    let mut tokens = Vec::new();
+    for identifier in text.split(|c: char| !c.is_alphanumeric() && c != '_') {
+        if identifier.is_empty() {
+            continue;
+        }
+        let normalized = identifier.to_lowercase();
+        if normalized.len() >= 2 {
+            tokens.push(normalized.clone());
+        }
+        for component in split_identifier(identifier) {
+            let component = component.to_lowercase();
+            if component.len() >= 2 && component != normalized {
+                tokens.push(component);
+            }
+        }
+    }
+    tokens
+}
+
+fn split_identifier(identifier: &str) -> Vec<&str> {
+    let mut components = Vec::new();
+    for word in identifier.split('_').filter(|word| !word.is_empty()) {
+        let mut start = 0;
+        let mut previous_lowercase = false;
+        for (offset, character) in word.char_indices() {
+            if offset > 0 && character.is_uppercase() && previous_lowercase {
+                components.push(&word[start..offset]);
+                start = offset;
+            }
+            previous_lowercase = character.is_lowercase();
+        }
+        components.push(&word[start..]);
+    }
+    components
 }
 
 /// Public wrapper for `tokenize_for_index` — used by incremental indexing.
@@ -647,11 +746,15 @@ mod tests {
 
     #[test]
     fn test_tokenize_for_index() {
-        let tokens = tokenize_for_index("fn authenticate_user(username: &str) -> Result<String>");
+        let tokens =
+            tokenize_for_index("fn authenticate_user(username: &str) -> HttpResponse<String>");
         assert!(tokens.contains(&"fn".to_string()));
         assert!(tokens.contains(&"authenticate_user".to_string()));
+        assert!(tokens.contains(&"authenticate".to_string()));
+        assert!(tokens.contains(&"user".to_string()));
         assert!(tokens.contains(&"username".to_string()));
-        assert!(tokens.contains(&"result".to_string()));
+        assert!(tokens.contains(&"http".to_string()));
+        assert!(tokens.contains(&"response".to_string()));
         assert!(tokens.contains(&"string".to_string()));
     }
 
@@ -682,5 +785,44 @@ mod tests {
         assert!(matches!(result, Err(IndexError::ChunkIdCollision { .. })));
         assert_eq!(index.get_chunk(7).unwrap().name.as_deref(), Some("first"));
         assert_eq!(index.vectors[&7], vec![1.0, 0.0]);
+    }
+
+    #[test]
+    fn test_bm25_prefers_shorter_document_with_same_term_frequency() {
+        let chunks = vec![
+            make_test_chunk(1, "short", "target helper"),
+            make_test_chunk(
+                2,
+                "long",
+                "target helper filler filler filler filler filler filler",
+            ),
+        ];
+        let index = SeekrIndex::build_from(&chunks, &[vec![0.0; 2], vec![0.0; 2]], 2);
+
+        let results = index.search_bm25("target", 2);
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].chunk_id, 1);
+        assert!(results[0].score > results[1].score);
+    }
+
+    #[test]
+    fn test_bm25_stats_are_invalidated_after_mutation() {
+        let mut index = SeekrIndex::build_from(
+            &[make_test_chunk(1, "first", "existing token")],
+            &[vec![0.0; 2]],
+            2,
+        );
+        assert!(!index.search_bm25("existing", 10).is_empty());
+
+        let chunk = make_test_chunk(2, "second", "newly added");
+        index.add_entry(
+            IndexEntry {
+                chunk_id: 2,
+                embedding: vec![0.0; 2],
+                text_tokens: tokenize_for_index(&chunk.body),
+            },
+            chunk,
+        );
+        assert_eq!(index.search_bm25("newly", 10)[0].chunk_id, 2);
     }
 }

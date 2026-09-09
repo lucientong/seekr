@@ -1,7 +1,7 @@
 //! Multi-source result fusion.
 //!
 //! Implements Reciprocal Rank Fusion (RRF) to combine results from
-//! text search and semantic search into a unified ranked list.
+//! lexical search and semantic search into a unified ranked list.
 //!
 //! Formula: `score = sum(1 / (k + rank_i))` where k defaults to 60.
 
@@ -20,7 +20,7 @@ pub struct FusedResult {
     /// The RRF fusion score.
     pub fused_score: f32,
 
-    /// Original score from text search (if any).
+    /// Original score from lexical search (if any).
     pub text_score: Option<f32>,
 
     /// Original score from semantic search (if any).
@@ -29,17 +29,17 @@ pub struct FusedResult {
     /// Original score from AST pattern search (if any).
     pub ast_score: Option<f32>,
 
-    /// Matched line numbers from text search (propagated for display).
+    /// Matched line numbers from lexical search (when available).
     pub matched_lines: Vec<usize>,
 }
 
 /// Perform Reciprocal Rank Fusion (RRF) on multiple result lists.
 ///
-/// Combines text search and semantic search results into a single
+/// Combines lexical search and semantic search results into a single
 /// ranked list using the RRF formula: `score = sum(1 / (k + rank))`.
 ///
 /// # Arguments
-/// * `text_results` - Results from text regex search (in rank order).
+/// * `text_results` - Results from lexical search (in rank order).
 /// * `semantic_results` - Results from semantic vector search (in rank order).
 /// * `k` - RRF parameter controlling rank discount (default: 60).
 /// * `top_k` - Maximum number of fused results to return.
@@ -51,7 +51,7 @@ pub fn rrf_fuse(
 ) -> Vec<FusedResult> {
     let mut scores: HashMap<u64, FusedResult> = HashMap::new();
 
-    // Process text search results
+    // Process lexical search results
     for (rank, result) in text_results.iter().enumerate() {
         let rrf_score = 1.0 / (k as f32 + rank as f32 + 1.0);
 
@@ -119,7 +119,7 @@ pub fn rrf_fuse_three(
 ) -> Vec<FusedResult> {
     let mut scores: HashMap<u64, FusedResult> = HashMap::new();
 
-    // Process text search results
+    // Process lexical search results
     for (rank, result) in text_results.iter().enumerate() {
         let rrf_score = 1.0 / (k as f32 + rank as f32 + 1.0);
 

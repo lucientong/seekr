@@ -13,7 +13,7 @@ use crate::search::fusion::{
     FusedResult, fuse_ast_only, fuse_semantic_only, fuse_text_only, rrf_fuse, rrf_fuse_three,
 };
 use crate::search::semantic::{SemanticSearchOptions, search_semantic};
-use crate::search::text::{TextSearchOptions, search_text_regex};
+use crate::search::text::{TextMatch, TextSearchOptions, search_text_regex};
 use crate::search::{SearchMode, SearchResult};
 
 #[derive(Debug, Clone)]
@@ -114,7 +114,15 @@ impl SearchEngine {
                 Ok(fuse_ast_only(&results, top_k))
             }
             SearchMode::Hybrid => {
-                let text_results = search_text_regex(index, query, &self.text_options(top_k))?;
+                let text_results: Vec<TextMatch> = index
+                    .search_bm25(query, top_k)
+                    .into_iter()
+                    .map(|hit| TextMatch {
+                        chunk_id: hit.chunk_id,
+                        matched_lines: Vec::new(),
+                        score: hit.score,
+                    })
+                    .collect();
                 let semantic_results = search_semantic(
                     index,
                     query,
@@ -217,5 +225,32 @@ mod tests {
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].chunk.id, 1);
+    }
+
+    #[test]
+    fn hybrid_uses_bm25_for_natural_language_queries() {
+        let chunks = vec![
+            chunk(1, "src/auth.rs", "rust", "fn verify_password_hash() {}"),
+            chunk(2, "src/cache.rs", "rust", "fn clear_cache() {}"),
+        ];
+        let index = SeekrIndex::build_from(&chunks, &[vec![1.0; 8], vec![0.0; 8]], 8);
+        let engine = SearchEngine::new(
+            SearchConfig::default(),
+            Some(Arc::new(DummyEmbedder::new(8))),
+        );
+
+        let results = engine
+            .search(
+                &index,
+                "verify password [hash",
+                SearchMode::Hybrid,
+                &SearchOptions {
+                    top_k: 10,
+                    ..SearchOptions::default()
+                },
+            )
+            .expect("BM25 hybrid queries must not be parsed as regular expressions");
+
+        assert!(results.iter().any(|result| result.chunk.id == 1));
     }
 }

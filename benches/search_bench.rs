@@ -82,9 +82,9 @@ fn bench_vector_search(c: &mut Criterion) {
     group.finish();
 }
 
-/// Benchmark text search (inverted index).
-fn bench_text_search(c: &mut Criterion) {
-    let mut group = c.benchmark_group("text_search");
+/// Benchmark lexical search (TF and BM25 over the inverted index).
+fn bench_lexical_search(c: &mut Criterion) {
+    let mut group = c.benchmark_group("lexical_search");
 
     for &n in &[500, 1000, 5000] {
         let chunks: Vec<CodeChunk> = (0..n)
@@ -93,8 +93,11 @@ fn bench_text_search(c: &mut Criterion) {
         let embeddings: Vec<Vec<f32>> = (0..n).map(|i| random_vec(384, i)).collect();
         let index = SeekrIndex::build_from(&chunks, &embeddings, 384);
 
-        group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, _| {
+        group.bench_with_input(BenchmarkId::new("term_frequency", n), &n, |b, _| {
             b.iter(|| index.search_text("authenticate user password", 10));
+        });
+        group.bench_with_input(BenchmarkId::new("bm25", n), &n, |b, _| {
+            b.iter(|| index.search_bm25("authenticate user password", 10));
         });
     }
 
@@ -147,7 +150,7 @@ criterion_group!(
     benches,
     bench_index_build,
     bench_vector_search,
-    bench_text_search,
+    bench_lexical_search,
     bench_cosine_similarity,
     bench_save_load,
 );

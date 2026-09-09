@@ -116,12 +116,11 @@ impl OnnxEmbedder {
     /// Uses the real tokenizer.json from all-MiniLM-L6-v2 for proper
     /// WordPiece tokenization, producing correct token IDs that match
     /// the model's vocabulary.
-    fn tokenize(&self, text: &str) -> (Vec<i64>, Vec<i64>) {
-        // Encode with special tokens ([CLS] and [SEP] are added automatically)
-        let encoding = self.tokenizer.encode(text, true).unwrap_or_else(|_| {
-            // Fallback: return empty encoding on error
-            self.tokenizer.encode("", true).unwrap()
-        });
+    fn tokenize(&self, text: &str) -> Result<(Vec<i64>, Vec<i64>), EmbedderError> {
+        let encoding = self
+            .tokenizer
+            .encode(text, true)
+            .map_err(|e| EmbedderError::OnnxError(format!("Tokenization failed: {e}")))?;
 
         let mut input_ids: Vec<i64> = encoding.get_ids().iter().map(|&id| id as i64).collect();
         let mut attention_mask: Vec<i64> = encoding
@@ -140,29 +139,21 @@ impl OnnxEmbedder {
             }
         }
 
-        // Pad to fixed length for batching
-        while input_ids.len() < MAX_SEQ_LENGTH {
-            input_ids.push(0);
-            attention_mask.push(0);
-        }
-
-        (input_ids, attention_mask)
+        Ok((input_ids, attention_mask))
     }
 
-    /// Run inference on tokenized input.
-    fn run_inference(
+    /// Run one ONNX inference for an entire dynamically padded batch.
+    fn run_batch_inference(
         &self,
-        input_ids: &[i64],
-        attention_mask: &[i64],
-    ) -> Result<Vec<f32>, EmbedderError> {
-        let seq_len = input_ids.len();
-
-        let input_ids_array = ndarray::Array2::from_shape_vec((1, seq_len), input_ids.to_vec())
-            .map_err(|e| EmbedderError::OnnxError(format!("Shape error: {}", e)))?;
-        let attention_mask_array =
-            ndarray::Array2::from_shape_vec((1, seq_len), attention_mask.to_vec())
-                .map_err(|e| EmbedderError::OnnxError(format!("Shape error: {}", e)))?;
-        let token_type_ids_array = ndarray::Array2::<i64>::zeros((1, seq_len));
+        tokenized: &[(Vec<i64>, Vec<i64>)],
+    ) -> Result<Vec<Vec<f32>>, EmbedderError> {
+        if tokenized.is_empty() {
+            return Ok(Vec::new());
+        }
+        let batch_size = tokenized.len();
+        let (input_ids_array, attention_mask_array) = pad_tokenized_batch(tokenized)?;
+        let seq_len = input_ids_array.shape()[1];
+        let token_type_ids_array = ndarray::Array2::<i64>::zeros((batch_size, seq_len));
 
         // Create TensorRef inputs
         let input_ids_tensor = TensorRef::from_array_view(&input_ids_array)
@@ -198,10 +189,8 @@ impl OnnxEmbedder {
             .try_extract_array::<f32>()
             .map_err(|e| EmbedderError::OnnxError(format!("Extract error: {}", e)))?;
 
-        // Mean pooling: average over the sequence dimension (dim 1)
-        // tensor shape: [1, seq_len, hidden_size]
         let shape = tensor.shape();
-        if shape.len() != 3 {
+        if shape.len() != 3 || shape[0] != batch_size || shape[1] != seq_len {
             return Err(EmbedderError::OnnxError(format!(
                 "Unexpected output shape: {:?}",
                 shape
@@ -209,50 +198,93 @@ impl OnnxEmbedder {
         }
 
         let hidden_size = shape[2];
-        let mut pooled = vec![0.0f32; hidden_size];
-        let active_tokens: f32 = attention_mask.iter().map(|&m| m as f32).sum();
-
-        if active_tokens > 0.0 {
-            for seq_idx in 0..shape[1] {
-                let mask = attention_mask.get(seq_idx).copied().unwrap_or(0) as f32;
-                if mask > 0.0 {
-                    for dim in 0..hidden_size {
-                        pooled[dim] += tensor[[0, seq_idx, dim]];
+        if hidden_size != EMBEDDING_DIM {
+            return Err(EmbedderError::DimensionMismatch {
+                expected: EMBEDDING_DIM,
+                actual: hidden_size,
+            });
+        }
+        let mut embeddings = Vec::with_capacity(batch_size);
+        for batch_idx in 0..batch_size {
+            let mut pooled = vec![0.0f32; hidden_size];
+            let active_tokens: f32 = attention_mask_array
+                .row(batch_idx)
+                .iter()
+                .map(|&mask| mask as f32)
+                .sum();
+            if active_tokens > 0.0 {
+                for seq_idx in 0..seq_len {
+                    if attention_mask_array[[batch_idx, seq_idx]] > 0 {
+                        for dim in 0..hidden_size {
+                            pooled[dim] += tensor[[batch_idx, seq_idx, dim]];
+                        }
                     }
                 }
+                for value in &mut pooled {
+                    *value /= active_tokens;
+                }
             }
-            for val in &mut pooled {
-                *val /= active_tokens;
-            }
-        }
 
-        // L2 normalize
-        let norm: f32 = pooled.iter().map(|x| x * x).sum::<f32>().sqrt();
-        if norm > 0.0 {
-            for x in &mut pooled {
-                *x /= norm;
+            let norm: f32 = pooled.iter().map(|value| value * value).sum::<f32>().sqrt();
+            if norm > 0.0 {
+                for value in &mut pooled {
+                    *value /= norm;
+                }
             }
+            embeddings.push(pooled);
         }
-
-        Ok(pooled)
+        Ok(embeddings)
     }
 }
 
 impl Embedder for OnnxEmbedder {
     fn embed(&self, text: &str) -> Result<Vec<f32>, EmbedderError> {
-        let (input_ids, attention_mask) = self.tokenize(text);
-        self.run_inference(&input_ids, &attention_mask)
+        self.embed_batch(&[text])?
+            .pop()
+            .ok_or_else(|| EmbedderError::OnnxError("Inference returned no embedding".to_string()))
     }
 
     fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbedderError> {
-        // For now, process sequentially. A proper implementation would
-        // batch inputs together for a single session.run() call.
-        texts.iter().map(|text| self.embed(text)).collect()
+        let tokenized = texts
+            .iter()
+            .map(|text| self.tokenize(text))
+            .collect::<Result<Vec<_>, _>>()?;
+        self.run_batch_inference(&tokenized)
     }
 
     fn dimension(&self) -> usize {
         EMBEDDING_DIM
     }
+}
+
+fn pad_tokenized_batch(
+    tokenized: &[(Vec<i64>, Vec<i64>)],
+) -> Result<(ndarray::Array2<i64>, ndarray::Array2<i64>), EmbedderError> {
+    let batch_size = tokenized.len();
+    let seq_len = tokenized
+        .iter()
+        .map(|(ids, _)| ids.len())
+        .max()
+        .unwrap_or(1);
+    let mut input_ids = Vec::with_capacity(batch_size * seq_len);
+    let mut attention_mask = Vec::with_capacity(batch_size * seq_len);
+    for (ids, mask) in tokenized {
+        if ids.len() != mask.len() {
+            return Err(EmbedderError::OnnxError(
+                "Token IDs and attention mask lengths differ".to_string(),
+            ));
+        }
+        input_ids.extend_from_slice(ids);
+        input_ids.resize(input_ids.len() + seq_len - ids.len(), 0);
+        attention_mask.extend_from_slice(mask);
+        attention_mask.resize(attention_mask.len() + seq_len - mask.len(), 0);
+    }
+
+    let input_ids = ndarray::Array2::from_shape_vec((batch_size, seq_len), input_ids)
+        .map_err(|e| EmbedderError::OnnxError(format!("Shape error: {e}")))?;
+    let attention_mask = ndarray::Array2::from_shape_vec((batch_size, seq_len), attention_mask)
+        .map_err(|e| EmbedderError::OnnxError(format!("Shape error: {e}")))?;
+    Ok((input_ids, attention_mask))
 }
 
 fn select_model_artifact() -> ModelArtifact {
@@ -379,5 +411,18 @@ mod tests {
     #[test]
     fn test_max_seq_length() {
         assert_eq!(MAX_SEQ_LENGTH, 256);
+    }
+
+    #[test]
+    fn test_batch_padding_uses_longest_sequence() {
+        let tokenized = vec![
+            (vec![101, 10, 102], vec![1, 1, 1]),
+            (vec![101, 20, 30, 40, 102], vec![1, 1, 1, 1, 1]),
+        ];
+        let (ids, mask) = pad_tokenized_batch(&tokenized).unwrap();
+
+        assert_eq!(ids.shape(), &[2, 5]);
+        assert_eq!(ids.row(0).to_vec(), vec![101, 10, 102, 0, 0]);
+        assert_eq!(mask.row(0).to_vec(), vec![1, 1, 1, 0, 0]);
     }
 }
