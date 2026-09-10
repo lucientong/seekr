@@ -22,11 +22,20 @@ use seekr_code::search::engine::{SearchEngine, SearchOptions};
 
 const CORPUS_VERSION: u32 = 1;
 
-/// v2.0.1 Hybrid baseline measured 2026-09-10 (macOS arm64, MiniLM):
-/// Recall@5 = 1.000, MRR = 0.900. Floors keep a small regression margin.
+/// v2.0.1 Hybrid baselines measured 2026-09-10 with the platform-specific
+/// quantized models: MRR = 0.900 on arm64 and 0.800 on x86_64.
+/// Floors keep a small regression margin without comparing unlike artifacts.
 const HYBRID_RECALL_AT_5_BASELINE: f32 = 1.0;
-const HYBRID_MRR_BASELINE: f32 = 0.9;
+const HYBRID_MRR_BASELINE: f32 = if cfg!(target_arch = "aarch64") {
+    0.9
+} else {
+    0.8
+};
 const BASELINE_MARGIN: f32 = 0.05;
+const EVALUATION_CUTOFF: usize = 5;
+// Above instant-distance's ef_search=100, Seekr intentionally uses exact
+// cosine search. Quality gates measure the model/ranker, not ANN randomness.
+const EXACT_CANDIDATE_COUNT: usize = 101;
 
 struct Judgment {
     query: &'static str,
@@ -311,7 +320,7 @@ fn evaluate(
                 judgment.query,
                 mode.clone(),
                 &SearchOptions {
-                    top_k: 5,
+                    top_k: EXACT_CANDIDATE_COUNT,
                     ..SearchOptions::default()
                 },
             )
@@ -319,7 +328,8 @@ fn evaluate(
         let relevant: HashSet<&str> = judgment.relevant_keys.iter().copied().collect();
         let rank = results
             .iter()
-            .position(|result| relevant.contains(chunk_key(&result.chunk).as_str()));
+            .position(|result| relevant.contains(chunk_key(&result.chunk).as_str()))
+            .filter(|rank| *rank < EVALUATION_CUTOFF);
         if rank.is_some() {
             recall_hits += 1;
         }
