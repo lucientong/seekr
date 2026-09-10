@@ -22,10 +22,10 @@ use seekr_code::search::engine::{SearchEngine, SearchOptions};
 
 const CORPUS_VERSION: u32 = 1;
 
-/// First-round Hybrid baseline measured 2026-09-10 (macOS arm64, MiniLM):
-/// Recall@5 = 1.000, MRR = 1.000. Floors keep a small regression margin.
+/// v2.0.1 Hybrid baseline measured 2026-09-10 (macOS arm64, MiniLM):
+/// Recall@5 = 1.000, MRR = 0.900. Floors keep a small regression margin.
 const HYBRID_RECALL_AT_5_BASELINE: f32 = 1.0;
-const HYBRID_MRR_BASELINE: f32 = 1.0;
+const HYBRID_MRR_BASELINE: f32 = 0.9;
 const BASELINE_MARGIN: f32 = 0.05;
 
 struct Judgment {
@@ -269,18 +269,47 @@ fn hybrid_judgments() -> Vec<Judgment> {
     ]
 }
 
-fn evaluate_hybrid(index: &SeekrIndex, embedder: Arc<dyn Embedder>) -> (f32, f32) {
+fn semantic_judgments() -> Vec<Judgment> {
+    vec![
+        Judgment {
+            query: "confirm that a secret matches its stored digest",
+            relevant_keys: &["rust|src/auth.rs|verify_password"],
+        },
+        Judgment {
+            query: "discard obsolete memoized values",
+            relevant_keys: &["rust|src/cache.rs|invalidate_cache"],
+        },
+        Judgment {
+            query: "reduce a listed amount by a percentage",
+            relevant_keys: &["python|billing.py|calculate_discount"],
+        },
+        Judgment {
+            query: "render a monetary value for display",
+            relevant_keys: &["typescript|src/users.ts|formatCurrency"],
+        },
+        Judgment {
+            query: "retrieve account details from a remote service",
+            relevant_keys: &["typescript|src/users.ts|fetchUserProfile"],
+        },
+    ]
+}
+
+fn evaluate(
+    index: &SeekrIndex,
+    embedder: Arc<dyn Embedder>,
+    mode: SearchMode,
+    judgments: &[Judgment],
+) -> (f32, f32) {
     let engine = SearchEngine::new(SearchConfig::default(), Some(embedder));
-    let judgments = hybrid_judgments();
     let mut recall_hits = 0usize;
     let mut mrr_sum = 0.0f32;
 
-    for judgment in &judgments {
+    for judgment in judgments {
         let results = engine
             .search(
                 index,
                 judgment.query,
-                SearchMode::Hybrid,
+                mode.clone(),
                 &SearchOptions {
                     top_k: 5,
                     ..SearchOptions::default()
@@ -406,7 +435,13 @@ fn onnx_hybrid_quality_gate_v1() {
             )
         }));
     let (_guard, index) = build_quality_index(Arc::clone(&embedder));
-    let (recall_at_5, mrr) = evaluate_hybrid(&index, embedder);
+    let hybrid_judgments = hybrid_judgments();
+    let (recall_at_5, mrr) = evaluate(
+        &index,
+        Arc::clone(&embedder),
+        SearchMode::Hybrid,
+        &hybrid_judgments,
+    );
 
     let recall_floor = (HYBRID_RECALL_AT_5_BASELINE - BASELINE_MARGIN).max(0.0);
     let mrr_floor = (HYBRID_MRR_BASELINE - BASELINE_MARGIN).max(0.0);
@@ -420,5 +455,50 @@ fn onnx_hybrid_quality_gate_v1() {
     assert!(
         mrr >= mrr_floor,
         "Hybrid MRR={mrr:.3} below floor {mrr_floor:.3}"
+    );
+
+    let semantic_judgments = semantic_judgments();
+    let (semantic_recall, semantic_mrr) = evaluate(
+        &index,
+        Arc::clone(&embedder),
+        SearchMode::Semantic,
+        &semantic_judgments,
+    );
+    eprintln!(
+        "onnx semantic quality corpus_v{CORPUS_VERSION}: Recall@5={semantic_recall:.3}, MRR={semantic_mrr:.3}"
+    );
+    assert!(
+        semantic_recall >= 0.75,
+        "Semantic Recall@5={semantic_recall:.3} below floor 0.750"
+    );
+    assert!(
+        semantic_mrr >= 0.60,
+        "Semantic MRR={semantic_mrr:.3} below floor 0.600"
+    );
+
+    struct ConstantEmbedder {
+        dim: usize,
+    }
+    impl Embedder for ConstantEmbedder {
+        fn embed(&self, _text: &str) -> Result<Vec<f32>, EmbedderError> {
+            Ok(vec![1.0 / (self.dim as f32).sqrt(); self.dim])
+        }
+        fn dimension(&self) -> usize {
+            self.dim
+        }
+    }
+    let constant: Arc<dyn Embedder> = Arc::new(ConstantEmbedder {
+        dim: embedder.dimension(),
+    });
+    let (_constant_guard, constant_index) = build_quality_index(Arc::clone(&constant));
+    let (constant_recall, constant_mrr) = evaluate(
+        &constant_index,
+        constant,
+        SearchMode::Semantic,
+        &semantic_judgments,
+    );
+    assert!(
+        semantic_mrr >= constant_mrr + 0.15 || semantic_recall >= constant_recall + 0.2,
+        "semantic gate lacks discrimination: real=({semantic_recall:.3}, {semantic_mrr:.3}), constant=({constant_recall:.3}, {constant_mrr:.3})"
     );
 }

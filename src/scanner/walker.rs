@@ -78,6 +78,7 @@ fn walk_directory_with_patterns(
     // Collect entries (using simple Walk for now, parallel walk for large dirs)
     let entries_mutex: Mutex<Vec<ScanEntry>> = Mutex::new(Vec::new());
     let skipped_mutex: Mutex<usize> = Mutex::new(0);
+    let errors_mutex: Mutex<usize> = Mutex::new(0);
 
     builder.build_parallel().run(|| {
         Box::new(|entry| {
@@ -103,14 +104,14 @@ fn walk_directory_with_patterns(
                                 }
                             }
                             Err(_) => {
-                                *skipped_mutex.lock().unwrap() += 1;
+                                *errors_mutex.lock().unwrap() += 1;
                             }
                         }
                     }
                     ignore::WalkState::Continue
                 }
                 Err(_) => {
-                    *skipped_mutex.lock().unwrap() += 1;
+                    *errors_mutex.lock().unwrap() += 1;
                     ignore::WalkState::Continue
                 }
             }
@@ -119,11 +120,13 @@ fn walk_directory_with_patterns(
 
     let entries = entries_mutex.into_inner().unwrap();
     let skipped = skipped_mutex.into_inner().unwrap();
+    let errors = errors_mutex.into_inner().unwrap();
     let duration = start.elapsed();
 
     tracing::info!(
         files = entries.len(),
         skipped = skipped,
+        errors = errors,
         duration_ms = duration.as_millis(),
         "Directory scan complete"
     );
@@ -131,6 +134,7 @@ fn walk_directory_with_patterns(
     Ok(ScanResult {
         entries,
         skipped,
+        errors,
         duration,
     })
 }

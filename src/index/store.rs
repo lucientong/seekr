@@ -12,7 +12,10 @@ use crate::INDEX_VERSION;
 use crate::error::IndexError;
 use crate::index::{IndexEntry, SearchHit};
 use crate::parser::{CallSite, CodeChunk};
-use crate::search::references::{CallerHit, REFERENCES_DISCLAIMER, ReferenceHit, score_reference};
+use crate::search::references::{
+    CallerHit, DEFAULT_REFERENCE_LIMIT, MAX_REFERENCE_LIMIT, REFERENCES_DISCLAIMER, ReferenceHit,
+    score_reference,
+};
 use crate::search::symbol::{SymbolSummary, is_indexable_symbol, normalize_symbol_name};
 
 // ============================================================
@@ -104,6 +107,11 @@ impl VectorStore {
                 row_ids.len(),
                 dim
             )));
+        }
+        if data.iter().any(|value| !value.is_finite()) {
+            return Err(IndexError::Corrupted(
+                "vector payload contains non-finite values".to_string(),
+            ));
         }
         let mut id_to_row = HashMap::with_capacity(row_ids.len());
         for (row, &chunk_id) in row_ids.iter().enumerate() {
@@ -213,6 +221,7 @@ pub struct SeekrIndex {
     bm25_stats: OnceLock<Bm25Stats>,
     symbol_index: OnceLock<HashMap<String, Vec<u64>>>,
     mention_index: OnceLock<HashMap<String, Vec<u64>>>,
+    mentions_valid: bool,
 }
 
 impl std::fmt::Debug for SeekrIndex {
@@ -244,6 +253,7 @@ impl SeekrIndex {
             bm25_stats: OnceLock::new(),
             symbol_index: OnceLock::new(),
             mention_index: OnceLock::new(),
+            mentions_valid: true,
         }
     }
 
@@ -257,6 +267,11 @@ impl SeekrIndex {
 
     pub fn format_version(&self) -> u32 {
         self.version
+    }
+
+    /// Whether a loaded index has a valid mentions sidecar.
+    pub fn mentions_valid(&self) -> bool {
+        self.mentions_valid
     }
 
     pub fn iter_chunks(&self) -> impl Iterator<Item = (&u64, &CodeChunk)> {
@@ -400,6 +415,13 @@ impl SeekrIndex {
         embeddings: &[Vec<f32>],
         embedding_dim: usize,
     ) -> Result<Self, IndexError> {
+        if chunks.len() != embeddings.len() {
+            return Err(IndexError::Corrupted(format!(
+                "chunk/embedding count mismatch: chunks={}, embeddings={}",
+                chunks.len(),
+                embeddings.len()
+            )));
+        }
         let mut index = Self::new(embedding_dim);
 
         for (chunk, embedding) in chunks.iter().zip(embeddings.iter()) {
@@ -438,7 +460,15 @@ impl SeekrIndex {
         top_k: usize,
         score_threshold: f32,
     ) -> Vec<SearchHit> {
-        if let Some(hnsw) = self.ensure_hnsw() {
+        if query_embedding.len() != self.embedding_dim || top_k == 0 {
+            return Vec::new();
+        }
+        // instant-distance's default ef_search is 100. Use the exact flat
+        // path when callers request more candidates so filtering cannot
+        // silently miss results outside the first 100 ANN candidates.
+        if top_k > 100 {
+            self.search_vector_brute_force(query_embedding, top_k, score_threshold)
+        } else if let Some(hnsw) = self.ensure_hnsw() {
             self.search_vector_hnsw(hnsw, query_embedding, top_k, score_threshold)
         } else {
             self.search_vector_brute_force(query_embedding, top_k, score_threshold)
@@ -679,11 +709,32 @@ impl SeekrIndex {
 
     /// Mentions of `name` joined to matching definition chunks (name-level only).
     pub fn references(&self, name: &str) -> Vec<ReferenceHit> {
+        self.references_filtered(name, None, &HashSet::new(), DEFAULT_REFERENCE_LIMIT)
+    }
+
+    /// Filtered and bounded name-level references for server APIs.
+    pub fn references_filtered(
+        &self,
+        name: &str,
+        path_prefix: Option<&Path>,
+        languages: &HashSet<String>,
+        limit: usize,
+    ) -> Vec<ReferenceHit> {
         let normalized = normalize_symbol_name(name);
-        if normalized.is_empty() {
+        let limit = limit.min(MAX_REFERENCE_LIMIT);
+        if normalized.is_empty() || limit == 0 {
             return Vec::new();
         }
-        let definitions = self.symbol_definitions(name);
+        let definitions: Vec<CodeChunk> = self
+            .symbol_definitions(name)
+            .into_iter()
+            .filter(|definition| definition.name.as_deref() == Some(name))
+            .filter(|definition| {
+                path_prefix.is_none_or(|prefix| definition.file_path.starts_with(prefix))
+                    && (languages.is_empty()
+                        || languages.contains(&definition.language.to_lowercase()))
+            })
+            .collect();
         if definitions.is_empty() {
             return Vec::new();
         }
@@ -697,7 +748,16 @@ impl SeekrIndex {
             let Some(mention) = self.call_sites.get(mention_id) else {
                 continue;
             };
+            if mention.callee_name != name
+                || path_prefix.is_some_and(|prefix| !mention.file_path.starts_with(prefix))
+                || (!languages.is_empty() && !languages.contains(&mention.language.to_lowercase()))
+            {
+                continue;
+            }
             for definition in &definitions {
+                if definition.language != mention.language {
+                    continue;
+                }
                 let (confidence, reasons) = score_reference(definition, mention, definition_count);
                 hits.push(ReferenceHit {
                     definition: definition.clone(),
@@ -706,6 +766,12 @@ impl SeekrIndex {
                     reasons,
                     disclaimer: REFERENCES_DISCLAIMER,
                 });
+                if hits.len() >= limit {
+                    break;
+                }
+            }
+            if hits.len() >= limit {
+                break;
             }
         }
         hits.sort_by(|left, right| {
@@ -727,11 +793,32 @@ impl SeekrIndex {
 
     /// Call sites whose callee matches `name` (callers of that symbol).
     pub fn callers(&self, name: &str) -> Vec<CallerHit> {
+        self.callers_filtered(name, None, &HashSet::new(), DEFAULT_REFERENCE_LIMIT)
+    }
+
+    /// Filtered and bounded name-level callers for server APIs.
+    pub fn callers_filtered(
+        &self,
+        name: &str,
+        path_prefix: Option<&Path>,
+        languages: &HashSet<String>,
+        limit: usize,
+    ) -> Vec<CallerHit> {
         let normalized = normalize_symbol_name(name);
-        if normalized.is_empty() {
+        let limit = limit.min(MAX_REFERENCE_LIMIT);
+        if normalized.is_empty() || limit == 0 {
             return Vec::new();
         }
-        let definitions = self.symbol_definitions(name);
+        let definitions: Vec<CodeChunk> = self
+            .symbol_definitions(name)
+            .into_iter()
+            .filter(|definition| definition.name.as_deref() == Some(name))
+            .filter(|definition| {
+                path_prefix.is_none_or(|prefix| definition.file_path.starts_with(prefix))
+                    && (languages.is_empty()
+                        || languages.contains(&definition.language.to_lowercase()))
+            })
+            .collect();
         let definition_count = definitions.len().max(1);
         let Some(mention_ids) = self.ensure_mention_index().get(&normalized) else {
             return Vec::new();
@@ -742,6 +829,12 @@ impl SeekrIndex {
             let Some(mention) = self.call_sites.get(mention_id) else {
                 continue;
             };
+            if mention.callee_name != name
+                || path_prefix.is_some_and(|prefix| !mention.file_path.starts_with(prefix))
+                || (!languages.is_empty() && !languages.contains(&mention.language.to_lowercase()))
+            {
+                continue;
+            }
             let caller_chunk = mention
                 .enclosing_chunk_id
                 .and_then(|chunk_id| self.chunks.get(&chunk_id).cloned());
@@ -770,6 +863,9 @@ impl SeekrIndex {
                 reasons,
                 disclaimer: REFERENCES_DISCLAIMER,
             });
+            if hits.len() >= limit {
+                break;
+            }
         }
         hits.sort_by(|left, right| {
             right
@@ -886,15 +982,15 @@ impl SeekrIndex {
         crate::index::atomic::atomic_write(&dir.join(MENTIONS_FILENAME), &framed)
     }
 
-    fn load_mentions_sidecar(&mut self, dir: &Path) -> Result<(), IndexError> {
+    fn load_mentions_sidecar(&mut self, dir: &Path) -> Result<bool, IndexError> {
         let path = dir.join(MENTIONS_FILENAME);
         if !path.exists() {
-            return Ok(());
+            return Ok(false);
         }
         let data = std::fs::read(&path)?;
         if data.len() < 20 || &data[..8] != MENTIONS_MAGIC {
             tracing::warn!(path = %path.display(), "Ignoring corrupt mentions sidecar");
-            return Ok(());
+            return Ok(false);
         }
         let version = u32::from_le_bytes(data[8..12].try_into().unwrap());
         if version != MENTIONS_SIDECAR_VERSION {
@@ -903,12 +999,18 @@ impl SeekrIndex {
                 version,
                 "Ignoring mentions sidecar with unsupported version"
             );
-            return Ok(());
+            return Ok(false);
         }
-        let payload_len = u64::from_le_bytes(data[12..20].try_into().unwrap()) as usize;
-        if data.len() != 20 + payload_len {
+        let payload_len = usize::try_from(u64::from_le_bytes(data[12..20].try_into().unwrap()))
+            .map_err(|_| {
+                IndexError::Corrupted("mentions payload length overflows usize".to_string())
+            })?;
+        let expected_len = 20usize.checked_add(payload_len).ok_or_else(|| {
+            IndexError::Corrupted("mentions payload length overflows frame".to_string())
+        })?;
+        if data.len() != expected_len {
             tracing::warn!(path = %path.display(), "Ignoring truncated mentions sidecar");
-            return Ok(());
+            return Ok(false);
         }
         let sidecar: MentionsSidecar = bincode::deserialize(&data[20..])
             .map_err(|e| IndexError::Serialization(e.to_string()))?;
@@ -917,12 +1019,12 @@ impl SeekrIndex {
                 path = %path.display(),
                 "Mentions sidecar fingerprint mismatch; dropping stale edges"
             );
-            return Ok(());
+            return Ok(false);
         }
         self.call_sites = sidecar.call_sites;
         self.file_to_call_sites = sidecar.file_to_call_sites;
         self.mention_index.take();
-        Ok(())
+        Ok(true)
     }
 
     fn chunk_fingerprint(&self) -> [u8; 32] {
@@ -1010,8 +1112,14 @@ impl SeekrIndex {
                     expected_version: INDEX_VERSION,
                 });
             }
-            let payload_len = u64::from_le_bytes(data[12..20].try_into().unwrap()) as usize;
-            if data.len() != 20 + payload_len {
+            let payload_len = usize::try_from(u64::from_le_bytes(data[12..20].try_into().unwrap()))
+                .map_err(|_| {
+                    IndexError::Corrupted("index payload length overflows usize".to_string())
+                })?;
+            let expected_len = 20usize.checked_add(payload_len).ok_or_else(|| {
+                IndexError::Corrupted("index payload length overflows frame".to_string())
+            })?;
+            if data.len() != expected_len {
                 return Err(IndexError::Corrupted(format!(
                     "index payload length mismatch: header={payload_len}, actual={}",
                     data.len().saturating_sub(20)
@@ -1033,9 +1141,13 @@ impl SeekrIndex {
         };
 
         index.index_dir = Some(dir.to_path_buf());
-        if let Err(error) = index.load_mentions_sidecar(dir) {
-            tracing::warn!(%error, "Failed to load mentions sidecar");
-        }
+        index.mentions_valid = match index.load_mentions_sidecar(dir) {
+            Ok(valid) => valid,
+            Err(error) => {
+                tracing::warn!(%error, "Failed to load mentions sidecar");
+                false
+            }
+        };
 
         tracing::info!(
             chunks = index.chunk_count,
@@ -1060,6 +1172,38 @@ impl SeekrIndex {
             payload.vector_data,
             payload.vector_row_ids,
         )?;
+        if vectors.len() != payload.chunks.len() {
+            return Err(IndexError::Corrupted(format!(
+                "vector count {} does not match chunk count {}",
+                vectors.len(),
+                payload.chunks.len()
+            )));
+        }
+        let vector_ids: HashSet<u64> = vectors.row_ids.iter().copied().collect();
+        let chunk_ids: HashSet<u64> = payload.chunks.keys().copied().collect();
+        if vector_ids != chunk_ids {
+            return Err(IndexError::Corrupted(
+                "vector row IDs do not match chunk IDs".to_string(),
+            ));
+        }
+        for (&map_id, chunk) in &payload.chunks {
+            if map_id != chunk.id {
+                return Err(IndexError::Corrupted(format!(
+                    "chunk map key {map_id} does not match embedded chunk id {}",
+                    chunk.id
+                )));
+            }
+        }
+        for (token, postings) in &payload.inverted_index {
+            if postings
+                .iter()
+                .any(|(chunk_id, frequency)| *frequency == 0 || !chunk_ids.contains(chunk_id))
+            {
+                return Err(IndexError::Corrupted(format!(
+                    "inverted postings for token '{token}' reference invalid chunks or frequencies"
+                )));
+            }
+        }
         Ok(Self {
             version: INDEX_VERSION,
             vectors,
@@ -1074,6 +1218,7 @@ impl SeekrIndex {
             bm25_stats: OnceLock::new(),
             symbol_index: OnceLock::new(),
             mention_index: OnceLock::new(),
+            mentions_valid: false,
         })
     }
 }

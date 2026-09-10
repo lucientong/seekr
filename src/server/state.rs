@@ -154,22 +154,11 @@ impl ProjectEngine {
             .iter()
             .map(|language| language.to_lowercase())
             .collect();
-        let mut hits: Vec<_> = index
-            .references(name)
-            .into_iter()
-            .filter(|hit| {
-                options
-                    .path_prefix
-                    .as_ref()
-                    .is_none_or(|prefix| hit.mention.file_path.starts_with(prefix))
-                    && (languages.is_empty()
-                        || languages.contains(&hit.mention.language.to_lowercase()))
-            })
-            .collect();
-        if let Some(limit) = options.limit {
-            hits.truncate(limit);
-        }
-        Ok(hits)
+        let limit = options
+            .limit
+            .unwrap_or(crate::search::references::DEFAULT_REFERENCE_LIMIT)
+            .min(crate::search::references::MAX_REFERENCE_LIMIT);
+        Ok(index.references_filtered(name, options.path_prefix.as_deref(), &languages, limit))
     }
 
     pub fn callers(
@@ -187,22 +176,11 @@ impl ProjectEngine {
             .iter()
             .map(|language| language.to_lowercase())
             .collect();
-        let mut hits: Vec<_> = index
-            .callers(name)
-            .into_iter()
-            .filter(|hit| {
-                options
-                    .path_prefix
-                    .as_ref()
-                    .is_none_or(|prefix| hit.mention.file_path.starts_with(prefix))
-                    && (languages.is_empty()
-                        || languages.contains(&hit.mention.language.to_lowercase()))
-            })
-            .collect();
-        if let Some(limit) = options.limit {
-            hits.truncate(limit);
-        }
-        Ok(hits)
+        let limit = options
+            .limit
+            .unwrap_or(crate::search::references::DEFAULT_REFERENCE_LIMIT)
+            .min(crate::search::references::MAX_REFERENCE_LIMIT);
+        Ok(index.callers_filtered(name, options.path_prefix.as_deref(), &languages, limit))
     }
 
     fn ensure_persisted_index(&self) -> Result<(), SeekrError> {

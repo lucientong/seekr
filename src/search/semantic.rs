@@ -39,6 +39,13 @@ pub fn search_semantic(
 ) -> Result<Vec<SearchHit>, SearchError> {
     // Embed the query
     let query_embedding = embedder.embed(query).map_err(SearchError::Embedder)?;
+    if query_embedding.len() != index.embedding_dim() {
+        return Err(crate::error::EmbedderError::DimensionMismatch {
+            expected: index.embedding_dim(),
+            actual: query_embedding.len(),
+        }
+        .into());
+    }
 
     // Search the vector index
     let results = index.search_vector(&query_embedding, options.top_k, options.score_threshold);

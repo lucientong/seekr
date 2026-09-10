@@ -119,8 +119,19 @@ fn node_to_call_site(
         return None;
     }
 
-    let enclosing_chunk_id = find_enclosing_chunk(chunks, &byte_range);
-    let id = stable_call_site_id(path, &call_kind, &callee_name, byte_range.start, &body);
+    let enclosing_chunk = find_enclosing_chunk(chunks, &byte_range);
+    let enclosing_chunk_id = enclosing_chunk.map(|chunk| chunk.id);
+    let relative_start = enclosing_chunk
+        .map(|chunk| byte_range.start.saturating_sub(chunk.byte_range.start))
+        .unwrap_or(byte_range.start);
+    let id = stable_call_site_id(
+        path,
+        &call_kind,
+        &callee_name,
+        enclosing_chunk_id,
+        relative_start,
+        &body,
+    );
 
     Some(CallSite {
         id,
@@ -196,21 +207,24 @@ fn is_identifier_like(name: &str) -> bool {
     (first.is_alphabetic() || first == '_') && chars.all(|c| c.is_alphanumeric() || c == '_')
 }
 
-fn find_enclosing_chunk(chunks: &[CodeChunk], call_range: &std::ops::Range<usize>) -> Option<u64> {
+fn find_enclosing_chunk<'a>(
+    chunks: &'a [CodeChunk],
+    call_range: &std::ops::Range<usize>,
+) -> Option<&'a CodeChunk> {
     chunks
         .iter()
         .filter(|chunk| {
             chunk.byte_range.start <= call_range.start && chunk.byte_range.end >= call_range.end
         })
         .min_by_key(|chunk| chunk.byte_range.end - chunk.byte_range.start)
-        .map(|chunk| chunk.id)
 }
 
 fn stable_call_site_id(
     path: &Path,
     kind: &CallKind,
     callee: &str,
-    byte_start: usize,
+    enclosing_chunk_id: Option<u64>,
+    relative_start: usize,
     body: &str,
 ) -> u64 {
     let mut hasher = blake3::Hasher::new();
@@ -225,7 +239,8 @@ fn stable_call_site_id(
         hasher.update(&(field.len() as u64).to_le_bytes());
         hasher.update(field);
     }
-    hasher.update(&(byte_start as u64).to_le_bytes());
+    hasher.update(&enclosing_chunk_id.unwrap_or_default().to_le_bytes());
+    hasher.update(&(relative_start as u64).to_le_bytes());
     let digest = hasher.finalize();
     u64::from_le_bytes(
         digest.as_bytes()[..8]

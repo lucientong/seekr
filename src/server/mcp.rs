@@ -96,7 +96,10 @@ const MCP_CONNECTION_SESSION_ID: &str = "mcp-stdio-connection";
 const ERROR_PARSE: i32 = -32700;
 const ERROR_INVALID_REQUEST: i32 = -32600;
 const ERROR_METHOD_NOT_FOUND: i32 = -32601;
+const ERROR_INVALID_PARAMS: i32 = -32602;
 const ERROR_INTERNAL: i32 = -32603;
+const MAX_TOP_K: usize = 1_000;
+const MAX_TOKEN_BUDGET: usize = 100_000;
 
 // ============================================================
 // MCP Server
@@ -111,6 +114,7 @@ pub fn run_mcp_stdio(config: &SeekrConfig) -> Result<(), crate::error::ServerErr
     let stdout = std::io::stdout();
     let mut stdout = stdout.lock();
     let registry = EngineRegistry::new(config.clone());
+    let mut initialized = false;
 
     tracing::info!("MCP Server starting on stdio");
 
@@ -128,14 +132,49 @@ pub fn run_mcp_stdio(config: &SeekrConfig) -> Result<(), crate::error::ServerErr
             continue;
         }
 
-        let request: JsonRpcRequest = match serde_json::from_str(line) {
-            Ok(req) => req,
+        let raw: Value = match serde_json::from_str(line) {
+            Ok(value) => value,
             Err(e) => {
-                let resp = JsonRpcResponse::error(None, ERROR_PARSE, format!("Parse error: {}", e));
+                let resp = JsonRpcResponse::error(
+                    Some(Value::Null),
+                    ERROR_PARSE,
+                    format!("Parse error: {}", e),
+                );
                 write_response(&mut stdout, &resp);
                 continue;
             }
         };
+        let id_present = raw
+            .as_object()
+            .is_some_and(|object| object.contains_key("id"));
+        let mut request: JsonRpcRequest = match serde_json::from_value(raw) {
+            Ok(request) => request,
+            Err(error) => {
+                let resp = JsonRpcResponse::error(
+                    Some(Value::Null),
+                    ERROR_INVALID_REQUEST,
+                    format!("Invalid Request: {error}"),
+                );
+                write_response(&mut stdout, &resp);
+                continue;
+            }
+        };
+        if id_present && request.id.is_none() {
+            request.id = Some(Value::Null);
+        }
+        if request
+            .id
+            .as_ref()
+            .is_some_and(|id| !id.is_null() && !id.is_string() && !id.is_number())
+        {
+            let resp = JsonRpcResponse::error(
+                Some(Value::Null),
+                ERROR_INVALID_REQUEST,
+                "Invalid Request: id must be a string, number, or null".to_string(),
+            );
+            write_response(&mut stdout, &resp);
+            continue;
+        }
 
         if request.jsonrpc != "2.0" {
             if request.id.is_none() {
@@ -150,7 +189,12 @@ pub fn run_mcp_stdio(config: &SeekrConfig) -> Result<(), crate::error::ServerErr
             continue;
         }
 
-        if let Some(response) = handle_request(&request, &registry, MCP_CONNECTION_SESSION_ID) {
+        if let Some(response) = handle_request(
+            &request,
+            &registry,
+            MCP_CONNECTION_SESSION_ID,
+            &mut initialized,
+        ) {
             write_response(&mut stdout, &response);
         }
     }
@@ -172,20 +216,39 @@ fn handle_request(
     request: &JsonRpcRequest,
     registry: &EngineRegistry,
     session_id: &str,
+    initialized: &mut bool,
 ) -> Option<JsonRpcResponse> {
     if request.id.is_none() {
         match request.method.as_str() {
             "notifications/initialized" | "initialized" => {
-                tracing::debug!("MCP client initialized");
+                if *initialized {
+                    tracing::debug!("MCP client initialized");
+                } else {
+                    tracing::warn!("Ignoring initialized notification before initialize");
+                }
             }
             _ => tracing::debug!(method = %request.method, "Ignoring JSON-RPC notification"),
         }
         return None;
     }
 
+    if !*initialized && request.method != "initialize" && request.method != "ping" {
+        return Some(JsonRpcResponse::error(
+            request.id.clone(),
+            ERROR_INVALID_REQUEST,
+            "MCP session is not initialized".to_string(),
+        ));
+    }
+
     Some(match request.method.as_str() {
         // MCP lifecycle
-        "initialize" => handle_initialize(request),
+        "initialize" => {
+            let response = handle_initialize(request);
+            if response.error.is_none() {
+                *initialized = true;
+            }
+            response
+        }
         "ping" => JsonRpcResponse::success(request.id.clone(), serde_json::json!({})),
 
         // MCP discovery
@@ -208,6 +271,28 @@ fn handle_request(
 // ============================================================
 
 fn handle_initialize(request: &JsonRpcRequest) -> JsonRpcResponse {
+    let Some(params) = request.params.as_ref().and_then(Value::as_object) else {
+        return JsonRpcResponse::error(
+            request.id.clone(),
+            ERROR_INVALID_PARAMS,
+            "initialize params must be an object".to_string(),
+        );
+    };
+    if params
+        .get("protocolVersion")
+        .and_then(Value::as_str)
+        .is_none()
+        || params
+            .get("clientInfo")
+            .and_then(Value::as_object)
+            .is_none()
+    {
+        return JsonRpcResponse::error(
+            request.id.clone(),
+            ERROR_INVALID_PARAMS,
+            "initialize requires protocolVersion and clientInfo".to_string(),
+        );
+    }
     JsonRpcResponse::success(
         request.id.clone(),
         serde_json::json!({
@@ -450,7 +535,7 @@ fn handle_tools_call(
         None => {
             return JsonRpcResponse::error(
                 request.id.clone(),
-                ERROR_INVALID_REQUEST,
+                ERROR_INVALID_PARAMS,
                 "Missing params".to_string(),
             );
         }
@@ -472,12 +557,37 @@ fn handle_tools_call(
         "seekr_callers" => handle_tool_callers(request.id.clone(), &arguments, registry),
         "seekr_index" => handle_tool_index(request.id.clone(), &arguments, registry),
         "seekr_status" => handle_tool_status(request.id.clone(), &arguments, registry.config()),
-        _ => JsonRpcResponse::error(
-            request.id.clone(),
-            ERROR_METHOD_NOT_FOUND,
-            format!("Unknown tool: {}", tool_name),
-        ),
+        _ => tool_failure(request.id.clone(), format!("Unknown tool: {tool_name}")),
     }
+}
+
+fn tool_failure(id: Option<Value>, message: impl Into<String>) -> JsonRpcResponse {
+    JsonRpcResponse::success(
+        id,
+        serde_json::json!({
+            "content": [{ "type": "text", "text": message.into() }],
+            "isError": true
+        }),
+    )
+}
+
+fn bounded_usize_argument(
+    arguments: &Value,
+    name: &str,
+    default: usize,
+    max: usize,
+) -> Result<usize, String> {
+    let Some(value) = arguments.get(name) else {
+        return Ok(default);
+    };
+    let value = value
+        .as_u64()
+        .ok_or_else(|| format!("{name} must be a non-negative integer"))?;
+    let value = usize::try_from(value).map_err(|_| format!("{name} is too large"))?;
+    if value > max {
+        return Err(format!("{name} must not exceed {max}"));
+    }
+    Ok(value)
 }
 
 /// Handle `seekr_search` tool call.
@@ -495,18 +605,23 @@ fn handle_tool_search(
         .get("mode")
         .and_then(|v| v.as_str())
         .unwrap_or("hybrid");
-    let top_k = arguments
-        .get("top_k")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(20) as usize;
-    let max_results = arguments
-        .get("max_results")
-        .and_then(|v| v.as_u64())
-        .map(|value| value as usize);
-    let max_tokens = arguments
-        .get("max_tokens")
-        .and_then(|v| v.as_u64())
-        .map(|value| value as usize);
+    let top_k = match bounded_usize_argument(arguments, "top_k", 20, MAX_TOP_K) {
+        Ok(value) => value,
+        Err(error) => return tool_failure(id, error),
+    };
+    let max_results = match arguments.get("max_results") {
+        Some(_) => match bounded_usize_argument(arguments, "max_results", top_k, MAX_TOP_K) {
+            Ok(value) if value <= top_k => Some(value),
+            Ok(_) => return tool_failure(id, "max_results must not exceed top_k"),
+            Err(error) => return tool_failure(id, error),
+        },
+        None => None,
+    };
+    let max_tokens = match bounded_usize_argument(arguments, "max_tokens", 20_000, MAX_TOKEN_BUDGET)
+    {
+        Ok(value) => Some(value),
+        Err(error) => return tool_failure(id, error),
+    };
     let project_path_str = arguments
         .get("project_path")
         .and_then(|v| v.as_str())
@@ -515,7 +630,7 @@ fn handle_tool_search(
         .get("path_prefix")
         .and_then(|v| v.as_str())
         .map(Path::new);
-    let languages = arguments
+    let languages: Vec<String> = arguments
         .get("languages")
         .and_then(Value::as_array)
         .map(|values| {
@@ -528,12 +643,15 @@ fn handle_tool_search(
         .unwrap_or_default();
 
     if query.is_empty() {
-        return JsonRpcResponse::error(id, ERROR_INVALID_REQUEST, "Missing query".to_string());
+        return tool_failure(id, "Missing query");
+    }
+    if query.len() > 16_384 || languages.len() > 64 {
+        return tool_failure(id, "query must be <=16384 bytes and languages <=64");
     }
 
     let search_mode: SearchMode = match mode_str.parse() {
         Ok(m) => m,
-        Err(e) => return JsonRpcResponse::error(id, ERROR_INVALID_REQUEST, e),
+        Err(e) => return tool_failure(id, e),
     };
 
     let project_path = Path::new(project_path_str)
@@ -615,11 +733,7 @@ fn handle_tool_symbol_definition(
         .unwrap_or("")
         .trim();
     if name.is_empty() {
-        return JsonRpcResponse::error(
-            id,
-            ERROR_INVALID_REQUEST,
-            "Missing symbol name".to_string(),
-        );
+        return tool_failure(id, "Missing symbol name");
     }
     let project_path = resolve_project_path(arguments, "project_path");
     let engine = match registry.get_or_create(&project_path) {
@@ -710,11 +824,13 @@ fn reference_options_from_args(arguments: &Value, project_path: &Path) -> Refere
     let limit = arguments
         .get("limit")
         .and_then(Value::as_u64)
-        .map(|value| value as usize);
+        .and_then(|value| usize::try_from(value).ok())
+        .unwrap_or(crate::search::references::DEFAULT_REFERENCE_LIMIT)
+        .min(crate::search::references::MAX_REFERENCE_LIMIT);
     ReferenceOptions {
         path_prefix,
         languages,
-        limit,
+        limit: Some(limit),
     }
 }
 
@@ -729,11 +845,7 @@ fn handle_tool_references(
         .unwrap_or("")
         .trim();
     if name.is_empty() {
-        return JsonRpcResponse::error(
-            id,
-            ERROR_INVALID_REQUEST,
-            "Missing symbol name".to_string(),
-        );
+        return tool_failure(id, "Missing symbol name");
     }
     let project_path = resolve_project_path(arguments, "project_path");
     let engine = match registry.get_or_create(&project_path) {
@@ -788,11 +900,7 @@ fn handle_tool_callers(
         .unwrap_or("")
         .trim();
     if name.is_empty() {
-        return JsonRpcResponse::error(
-            id,
-            ERROR_INVALID_REQUEST,
-            "Missing symbol name".to_string(),
-        );
+        return tool_failure(id, "Missing symbol name");
     }
     let project_path = resolve_project_path(arguments, "project_path");
     let engine = match registry.get_or_create(&project_path) {
@@ -1134,6 +1242,7 @@ mod tests {
     #[test]
     fn notifications_do_not_produce_responses() {
         let registry = EngineRegistry::new(SeekrConfig::default());
+        let mut initialized = true;
         for method in [
             "notifications/initialized",
             "initialized",
@@ -1145,7 +1254,15 @@ mod tests {
                 method: method.to_string(),
                 params: None,
             };
-            assert!(handle_request(&request, &registry, MCP_CONNECTION_SESSION_ID).is_none());
+            assert!(
+                handle_request(
+                    &request,
+                    &registry,
+                    MCP_CONNECTION_SESSION_ID,
+                    &mut initialized
+                )
+                .is_none()
+            );
         }
     }
 }

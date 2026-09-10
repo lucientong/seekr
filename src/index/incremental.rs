@@ -11,6 +11,15 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::IndexError;
 
+/// One immutable file snapshot used for change detection, parsing and state.
+#[derive(Debug)]
+pub struct FileSnapshot {
+    pub path: PathBuf,
+    pub content: Vec<u8>,
+    pub mtime: SystemTime,
+    pub content_hash: String,
+}
+
 /// State of a previously indexed file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileState {
@@ -35,7 +44,7 @@ pub struct IncrementalState {
 #[derive(Debug)]
 pub struct FileChanges {
     /// Files that are new or have been modified.
-    pub changed: Vec<PathBuf>,
+    pub changed: Vec<FileSnapshot>,
 
     /// Files that have been deleted since last index.
     pub deleted: Vec<PathBuf>,
@@ -69,35 +78,30 @@ impl IncrementalState {
     }
 
     /// Detect changes between the current file system state and the last index.
-    pub fn detect_changes(&self, current_files: &[PathBuf]) -> FileChanges {
+    pub fn detect_changes(&self, current_files: &[PathBuf]) -> Result<FileChanges, IndexError> {
         let mut changed = Vec::new();
         let mut unchanged = Vec::new();
 
         let current_set: std::collections::HashSet<&PathBuf> = current_files.iter().collect();
 
         for file in current_files {
-            if let Some(prev_state) = self.files.get(file) {
-                // Check if file has changed
-                let mtime = std::fs::metadata(file).and_then(|m| m.modified()).ok();
-
-                if mtime != Some(prev_state.mtime) {
-                    // Mtime changed, verify with content hash
-                    if let Ok(content) = std::fs::read(file) {
-                        let hash = blake3::hash(&content).to_hex().to_string();
-                        if hash != prev_state.content_hash {
-                            changed.push(file.clone());
-                        } else {
-                            unchanged.push(file.clone());
-                        }
-                    } else {
-                        changed.push(file.clone());
-                    }
-                } else {
-                    unchanged.push(file.clone());
-                }
+            let content = std::fs::read(file)?;
+            let metadata = std::fs::metadata(file)?;
+            let mtime = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+            let content_hash = blake3::hash(&content).to_hex().to_string();
+            if self
+                .files
+                .get(file)
+                .is_some_and(|previous| previous.content_hash == content_hash)
+            {
+                unchanged.push(file.clone());
             } else {
-                // New file
-                changed.push(file.clone());
+                changed.push(FileSnapshot {
+                    path: file.clone(),
+                    content,
+                    mtime,
+                    content_hash,
+                });
             }
         }
 
@@ -109,11 +113,11 @@ impl IncrementalState {
             .cloned()
             .collect();
 
-        FileChanges {
+        Ok(FileChanges {
             changed,
             deleted,
             unchanged,
-        }
+        })
     }
 
     /// Update the state for a file that has been indexed.
@@ -122,12 +126,22 @@ impl IncrementalState {
         let mtime = std::fs::metadata(&path)
             .and_then(|m| m.modified())
             .unwrap_or(SystemTime::UNIX_EPOCH);
+        self.update_snapshot(path, mtime, hash, chunk_ids);
+    }
 
+    /// Update state from the exact immutable snapshot that was indexed.
+    pub fn update_snapshot(
+        &mut self,
+        path: PathBuf,
+        mtime: SystemTime,
+        content_hash: String,
+        chunk_ids: Vec<u64>,
+    ) {
         self.files.insert(
             path,
             FileState {
                 mtime,
-                content_hash: hash,
+                content_hash,
                 chunk_ids,
             },
         );
@@ -191,10 +205,34 @@ mod tests {
 
     #[test]
     fn test_detect_new_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("new.rs");
+        std::fs::write(&path, "fn new() {}").unwrap();
         let state = IncrementalState::default();
-        let changes = state.detect_changes(&[PathBuf::from("/new/file.rs")]);
+        let changes = state.detect_changes(std::slice::from_ref(&path)).unwrap();
         assert_eq!(changes.changed.len(), 1);
+        assert_eq!(changes.changed[0].path, path);
         assert!(changes.deleted.is_empty());
         assert!(changes.unchanged.is_empty());
+    }
+
+    #[test]
+    fn content_change_is_detected_even_when_mtime_is_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("same-mtime.rs");
+        std::fs::write(&path, "fn before() {}").unwrap();
+        let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let mut state = IncrementalState::default();
+        state.update_snapshot(
+            path.clone(),
+            mtime,
+            blake3::hash(b"fn before() {}").to_hex().to_string(),
+            vec![1],
+        );
+
+        std::fs::write(&path, "fn after() {}").unwrap();
+        // The detector is content-authoritative, independent of mtime.
+        let changes = state.detect_changes(&[path]).unwrap();
+        assert_eq!(changes.changed.len(), 1);
     }
 }

@@ -45,6 +45,9 @@ pub enum ScannerError {
     #[error("File filter error: {0}")]
     FilterError(String),
 
+    #[error("Directory scan incomplete: {errors} traversal or metadata error(s)")]
+    Incomplete { errors: usize },
+
     #[error("File watcher error: {0}")]
     WatchError(String),
 }

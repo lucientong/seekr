@@ -3,6 +3,7 @@ name: CI
 on:
   push:
     branches: [master, main]
+    tags: ["v*"]
   pull_request:
     branches: [master, main]
 
@@ -55,8 +56,12 @@ jobs:
       - run: cargo test --locked
 
   quality:
-    name: Retrieval quality (ONNX Hybrid)
-    runs-on: ubuntu-latest
+    name: Retrieval quality (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -64,23 +69,10 @@ jobs:
       - name: Cache Seekr ONNX models
         uses: actions/cache@v4
         with:
-          path: ~/.seekr/models
-          key: seekr-onnx-minilm-${{ runner.os }}-v1
-      - name: Run Hybrid quality gate
+          path: ${{ runner.temp }}/seekr-models
+          key: seekr-onnx-minilm-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('src/embedder/onnx.rs') }}
+      - name: Run semantic and hybrid quality gates
         env:
           SEEKR_QUALITY_GATE: "1"
-          SEEKR_MODEL_DIR: ${{ github.workspace }}/.seekr-models
-        run: |
-          mkdir -p "$SEEKR_MODEL_DIR"
-          # Prefer the shared cache path when populated.
-          if [ -d "$HOME/.seekr/models" ] && [ "$(ls -A "$HOME/.seekr/models" 2>/dev/null)" ]; then
-            export SEEKR_MODEL_DIR="$HOME/.seekr/models"
-          fi
-          cargo test --locked --test retrieval_quality_test onnx_hybrid_quality_gate_v1 -- --nocapture
-      - name: Persist models into cache path
-        if: always()
-        run: |
-          mkdir -p "$HOME/.seekr/models"
-          if [ -d "${{ github.workspace }}/.seekr-models" ]; then
-            cp -R "${{ github.workspace }}/.seekr-models/." "$HOME/.seekr/models/" || true
-          fi
+          SEEKR_MODEL_DIR: ${{ runner.temp }}/seekr-models
+        run: cargo test --locked --test retrieval_quality_test onnx_hybrid_quality_gate_v1 -- --nocapture

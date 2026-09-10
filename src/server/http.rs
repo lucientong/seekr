@@ -11,7 +11,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
-use axum::extract::State;
+use axum::extract::{DefaultBodyLimit, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -28,7 +28,13 @@ use crate::server::state::EngineRegistry;
 /// Shared application state for HTTP handlers.
 pub struct AppState {
     pub registry: EngineRegistry,
+    allowed_root: std::path::PathBuf,
 }
+
+const MAX_REQUEST_BODY_BYTES: usize = 1_048_576;
+const MAX_QUERY_BYTES: usize = 16_384;
+const MAX_TOP_K: usize = 1_000;
+const MAX_TOKEN_BUDGET: usize = 100_000;
 
 // ============================================================
 // Request / Response types
@@ -185,7 +191,17 @@ pub async fn start_http_server_with_registry(
     port: u16,
     registry: EngineRegistry,
 ) -> Result<(), crate::error::ServerError> {
-    let state = Arc::new(AppState { registry });
+    let allowed_root = std::env::current_dir()
+        .and_then(|path| path.canonicalize())
+        .map_err(|error| {
+            crate::error::ServerError::Internal(format!(
+                "Failed to resolve HTTP workspace root: {error}"
+            ))
+        })?;
+    let state = Arc::new(AppState {
+        registry,
+        allowed_root: allowed_root.clone(),
+    });
 
     let app = Router::new()
         .route("/search", post(handle_search))
@@ -194,10 +210,15 @@ pub async fn start_http_server_with_registry(
         .route("/callers", post(handle_callers))
         .route("/status", get(handle_status))
         .route("/health", get(handle_health))
+        .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
         .with_state(state);
 
     let addr = format!("{}:{}", host, port);
-    tracing::info!(address = %addr, "Starting HTTP server");
+    tracing::info!(
+        address = %addr,
+        allowed_root = %allowed_root.display(),
+        "Starting HTTP server"
+    );
 
     let listener =
         TcpListener::bind(&addr)
@@ -228,6 +249,64 @@ async fn handle_health() -> Json<serde_json::Value> {
     }))
 }
 
+type HttpError = (StatusCode, Json<ErrorResponse>);
+
+fn bad_request(error: &str, details: impl Into<String>) -> HttpError {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(ErrorResponse {
+            error: error.to_string(),
+            details: Some(details.into()),
+        }),
+    )
+}
+
+fn resolve_allowed_project(state: &AppState, input: &str) -> Result<std::path::PathBuf, HttpError> {
+    let path = Path::new(input).canonicalize().map_err(|error| {
+        bad_request(
+            "Invalid project path",
+            format!("{}: {error}", Path::new(input).display()),
+        )
+    })?;
+    if !path.starts_with(&state.allowed_root) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(ErrorResponse {
+                error: "Project path outside HTTP workspace".to_string(),
+                details: Some(format!("Allowed root: {}", state.allowed_root.display())),
+            }),
+        ));
+    }
+    Ok(path)
+}
+
+fn resolve_path_prefix(
+    project_path: &Path,
+    prefix: Option<&str>,
+) -> Result<Option<std::path::PathBuf>, HttpError> {
+    let Some(prefix) = prefix else {
+        return Ok(None);
+    };
+    let candidate = if Path::new(prefix).is_absolute() {
+        Path::new(prefix).to_path_buf()
+    } else {
+        project_path.join(prefix)
+    };
+    let candidate = candidate.canonicalize().map_err(|error| {
+        bad_request(
+            "Invalid path prefix",
+            format!("{}: {error}", candidate.display()),
+        )
+    })?;
+    if !candidate.starts_with(project_path) {
+        return Err(bad_request(
+            "Invalid path prefix",
+            "path_prefix must remain inside project_path",
+        ));
+    }
+    Ok(Some(candidate))
+}
+
 /// `POST /search` — Execute a code search.
 async fn handle_search(
     State(state): State<Arc<AppState>>,
@@ -246,10 +325,24 @@ async fn handle_search(
         )
     })?;
 
-    // Resolve project path
-    let project_path = Path::new(&req.project_path)
-        .canonicalize()
-        .unwrap_or_else(|_| Path::new(&req.project_path).to_path_buf());
+    if req.query.len() > MAX_QUERY_BYTES
+        || req.top_k > MAX_TOP_K
+        || req
+            .max_results
+            .is_some_and(|value| value > req.top_k || value > MAX_TOP_K)
+        || req.max_tokens.is_some_and(|value| value > MAX_TOKEN_BUDGET)
+        || req.languages.len() > 64
+    {
+        return Err(bad_request(
+            "Search limits exceeded",
+            format!(
+                "query<={MAX_QUERY_BYTES} bytes, top_k/max_results<={MAX_TOP_K}, max_tokens<={MAX_TOKEN_BUDGET}, languages<=64"
+            ),
+        ));
+    }
+
+    // Resolve project path inside the server's startup workspace.
+    let project_path = resolve_allowed_project(&state, &req.project_path)?;
     let session_id = req.session_id.filter(|session_id| !session_id.is_empty());
     if session_id
         .as_ref()
@@ -286,14 +379,7 @@ async fn handle_search(
                 }),
             )
         })?;
-    let path_prefix = req.path_prefix.as_ref().map(|prefix| {
-        let path = Path::new(prefix);
-        if path.is_absolute() {
-            path.to_path_buf()
-        } else {
-            project_path.join(path)
-        }
-    });
+    let path_prefix = resolve_path_prefix(&project_path, req.path_prefix.as_deref())?;
     let top_k = req.top_k;
     let max_results = req.max_results;
     let max_tokens = req.max_tokens;
@@ -362,9 +448,7 @@ async fn handle_index(
     State(state): State<Arc<AppState>>,
     Json(req): Json<IndexRequest>,
 ) -> Result<Json<IndexResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let project_path = Path::new(&req.path)
-        .canonicalize()
-        .unwrap_or_else(|_| Path::new(&req.path).to_path_buf());
+    let project_path = resolve_allowed_project(&state, &req.path)?;
     let engine = state
         .registry
         .get_or_create_async(project_path)
@@ -417,7 +501,7 @@ async fn handle_references(
             }),
         ));
     }
-    let (project_path, options) = reference_request_parts(&req);
+    let (project_path, options) = reference_request_parts(&state, &req)?;
     let engine = state
         .registry
         .get_or_create_async(project_path)
@@ -473,7 +557,7 @@ async fn handle_callers(
             }),
         ));
     }
-    let (project_path, options) = reference_request_parts(&req);
+    let (project_path, options) = reference_request_parts(&state, &req)?;
     let engine = state
         .registry
         .get_or_create_async(project_path)
@@ -515,38 +599,43 @@ async fn handle_callers(
     }))
 }
 
-fn reference_request_parts(req: &ReferenceRequest) -> (std::path::PathBuf, ReferenceOptions) {
-    let project_path = Path::new(&req.project_path)
-        .canonicalize()
-        .unwrap_or_else(|_| Path::new(&req.project_path).to_path_buf());
-    let path_prefix = req.path_prefix.as_ref().map(|prefix| {
-        let prefix = Path::new(prefix);
-        if prefix.is_absolute() {
-            prefix.to_path_buf()
-        } else {
-            project_path.join(prefix)
-        }
-    });
-    (
+fn reference_request_parts(
+    state: &AppState,
+    req: &ReferenceRequest,
+) -> Result<(std::path::PathBuf, ReferenceOptions), HttpError> {
+    if req
+        .limit
+        .is_some_and(|limit| limit > crate::search::references::MAX_REFERENCE_LIMIT)
+        || req.languages.len() > 64
+    {
+        return Err(bad_request(
+            "Reference limits exceeded",
+            format!(
+                "limit<={}, languages<=64",
+                crate::search::references::MAX_REFERENCE_LIMIT
+            ),
+        ));
+    }
+    let project_path = resolve_allowed_project(state, &req.project_path)?;
+    let path_prefix = resolve_path_prefix(&project_path, req.path_prefix.as_deref())?;
+    Ok((
         project_path,
         ReferenceOptions {
             path_prefix,
             languages: req.languages.clone(),
             limit: req.limit,
         },
-    )
+    ))
 }
 
 /// `GET /status` — Query index status.
 async fn handle_status(
     State(state): State<Arc<AppState>>,
     axum::extract::Query(query): axum::extract::Query<StatusQuery>,
-) -> Json<StatusResponse> {
+) -> Result<Json<StatusResponse>, HttpError> {
     let config = state.registry.config();
 
-    let project_path = Path::new(&query.path)
-        .canonicalize()
-        .unwrap_or_else(|_| Path::new(&query.path).to_path_buf());
+    let project_path = resolve_allowed_project(&state, &query.path)?;
 
     let index_dir = config.project_index_dir(&project_path);
     // Check for v2 bincode index first, fall back to v1 JSON index
@@ -554,7 +643,7 @@ async fn handle_status(
         index_dir.join("index.bin").exists() || index_dir.join("index.json").exists();
 
     if !index_exists {
-        return Json(StatusResponse {
+        return Ok(Json(StatusResponse {
             indexed: false,
             project: project_path.display().to_string(),
             index_dir: index_dir.display().to_string(),
@@ -563,10 +652,10 @@ async fn handle_status(
             version: None,
             error: None,
             message: Some("No index found. Run `seekr-code index` first.".to_string()),
-        });
+        }));
     }
 
-    match SeekrIndex::load(&index_dir) {
+    Ok(match SeekrIndex::load(&index_dir) {
         Ok(index) => Json(StatusResponse {
             indexed: true,
             project: project_path.display().to_string(),
@@ -587,7 +676,7 @@ async fn handle_status(
             error: Some(e.to_string()),
             message: None,
         }),
-    }
+    })
 }
 
 #[cfg(test)]

@@ -32,6 +32,12 @@ pub struct ScanResult {
     /// Number of files skipped by filters.
     pub skipped: usize,
 
+    /// Number of traversal or metadata errors.
+    ///
+    /// A non-zero value means the scan is incomplete and must not be used to
+    /// infer deletions from an existing incremental index.
+    pub errors: usize,
+
     /// Total scan duration.
     pub duration: std::time::Duration,
 }

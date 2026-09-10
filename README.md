@@ -115,6 +115,10 @@ seekr-code serve --host 0.0.0.0 --port 8080
 seekr-code serve --watch /path/to/project
 ```
 
+The HTTP server only accepts project paths under the directory where it was
+started. Binding to a non-loopback address exposes source-code search and
+indexing APIs to the network; use a firewall or authenticated reverse proxy.
+
 **Endpoints:**
 
 | Method | Path          | Description                                      |
@@ -199,11 +203,11 @@ trait TraitName
 Configuration file: `~/.seekr/config.toml`
 
 ```toml
-# Index storage directory
-index_dir = "~/.seekr/indexes"
+# Index storage directory (must be an absolute path; `~` is not expanded)
+index_dir = "/absolute/path/to/.seekr/indexes"
 
 # ONNX model directory
-model_dir = "~/.seekr/models"
+model_dir = "/absolute/path/to/.seekr/models"
 
 # Embedding model name
 embed_model = "all-MiniLM-L6-v2"
